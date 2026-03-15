@@ -163,3 +163,132 @@ fn make_sockaddr_un(path: &Path) -> io::Result<libc::sockaddr_un> {
         .copy_from_slice(unsafe { &*(bytes as *const [u8] as *const [i8]) });
     Ok(addr)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn test_read_u32() {
+        let buf = [0x00, 0x00, 0x00, 0x2A]; // 42
+        let mut pos = 0;
+        assert_eq!(read_u32(&buf, &mut pos), Some(42));
+        assert_eq!(pos, 4);
+    }
+
+    #[test]
+    fn test_read_u32_truncated() {
+        let buf = [0x00, 0x00];
+        let mut pos = 0;
+        assert_eq!(read_u32(&buf, &mut pos), None);
+        assert_eq!(pos, 0);
+    }
+
+    #[test]
+    fn test_read_u32_empty() {
+        let mut pos = 0;
+        assert_eq!(read_u32(&[], &mut pos), None);
+    }
+
+    #[test]
+    fn test_read_u32_at_offset() {
+        let buf = [0xFF, 0xFF, 0x00, 0x00, 0x00, 0x01];
+        let mut pos = 2;
+        assert_eq!(read_u32(&buf, &mut pos), Some(1));
+        assert_eq!(pos, 6);
+    }
+
+    #[test]
+    fn test_read_string() {
+        let mut buf = Vec::new();
+        put_string(&mut buf, b"hello");
+        let mut pos = 0;
+        assert_eq!(read_string(&buf, &mut pos), Some(b"hello".as_slice()));
+        assert_eq!(pos, buf.len());
+    }
+
+    #[test]
+    fn test_read_string_truncated_length() {
+        let buf = [0x00, 0x00]; // not enough for u32 length
+        let mut pos = 0;
+        assert_eq!(read_string(&buf, &mut pos), None);
+    }
+
+    #[test]
+    fn test_read_string_truncated_data() {
+        let buf = [0x00, 0x00, 0x00, 0x0A, 0x01, 0x02]; // claims 10 bytes, only 2
+        let mut pos = 0;
+        assert_eq!(read_string(&buf, &mut pos), None);
+    }
+
+    #[test]
+    fn test_read_string_empty() {
+        let mut buf = Vec::new();
+        put_string(&mut buf, b"");
+        let mut pos = 0;
+        assert_eq!(read_string(&buf, &mut pos), Some(b"".as_slice()));
+    }
+
+    #[test]
+    fn test_put_u32_roundtrip() {
+        for val in [0u32, 1, 255, 65536, u32::MAX] {
+            let mut buf = Vec::new();
+            put_u32(&mut buf, val);
+            let mut pos = 0;
+            assert_eq!(read_u32(&buf, &mut pos), Some(val));
+        }
+    }
+
+    #[test]
+    fn test_put_string_roundtrip() {
+        for data in [b"".as_slice(), b"x", b"hello world", &[0xFF; 256]] {
+            let mut buf = Vec::new();
+            put_string(&mut buf, data);
+            let mut pos = 0;
+            assert_eq!(read_string(&buf, &mut pos), Some(data));
+        }
+    }
+
+    #[test]
+    fn test_read_write_message_roundtrip() {
+        let body = vec![11u8, 0, 0, 0, 1]; // REQUEST_IDENTITIES-like
+        let mut wire = Vec::new();
+        write_message(&mut wire, &body).unwrap();
+
+        let mut cursor = Cursor::new(&wire);
+        let got = read_message(&mut cursor).unwrap();
+        assert_eq!(got, body);
+    }
+
+    #[test]
+    fn test_read_message_zero_length() {
+        let wire = [0u8, 0, 0, 0]; // length = 0
+        let mut cursor = Cursor::new(&wire);
+        let err = read_message(&mut cursor).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_read_message_excessive_length() {
+        // length = 20 MiB (over 10 MiB cap)
+        let wire = 20u32.wrapping_mul(1024 * 1024).to_be_bytes();
+        let mut cursor = Cursor::new(&wire);
+        let err = read_message(&mut cursor).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_multiple_strings_sequential() {
+        let mut buf = Vec::new();
+        put_string(&mut buf, b"first");
+        put_string(&mut buf, b"second");
+        put_string(&mut buf, b"third");
+
+        let mut pos = 0;
+        assert_eq!(read_string(&buf, &mut pos), Some(b"first".as_slice()));
+        assert_eq!(read_string(&buf, &mut pos), Some(b"second".as_slice()));
+        assert_eq!(read_string(&buf, &mut pos), Some(b"third".as_slice()));
+        assert_eq!(read_string(&buf, &mut pos), None); // exhausted
+    }
+}
