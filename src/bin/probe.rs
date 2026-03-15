@@ -19,11 +19,7 @@ struct Cli {
 fn format_pids(pids: &HashSet<u32>) -> String {
     let mut sorted: Vec<_> = pids.iter().copied().collect();
     sorted.sort();
-    sorted
-        .iter()
-        .map(|p| p.to_string())
-        .collect::<Vec<_>>()
-        .join(", ")
+    sorted.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")
 }
 
 fn section(title: &str) {
@@ -89,11 +85,8 @@ fn print_keys(results: &[ProbeResult]) {
     section("Keys");
 
     for (fp, (key_type, comment, agents)) in &keys {
-        let label = if comment.is_empty() {
-            key_type.clone()
-        } else {
-            format!("{comment} ({key_type})")
-        };
+        let label =
+            if comment.is_empty() { key_type.clone() } else { format!("{comment} ({key_type})") };
         println!("  {fp}  {label}");
         let agents: Vec<_> = agents.iter().collect();
         for (i, agent) in agents.iter().enumerate() {
@@ -143,9 +136,7 @@ fn main() -> anyhow::Result<()> {
         .collect();
     results.sort_by(|a, b| a.path.cmp(&b.path));
 
-    let any_alive = results
-        .iter()
-        .any(|r| matches!(r.status, probe::AgentStatus::Alive(_)));
+    let any_alive = results.iter().any(|r| matches!(r.status, probe::AgentStatus::Alive(_)));
 
     print_agents(&results, cli.alive_only);
     print_keys(&results);

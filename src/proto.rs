@@ -97,18 +97,13 @@ fn connect_timeout(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
 
     if ret < 0 {
         let err = io::Error::last_os_error();
-        if err.kind() != io::ErrorKind::WouldBlock
-            && err.raw_os_error() != Some(libc::EINPROGRESS)
+        if err.kind() != io::ErrorKind::WouldBlock && err.raw_os_error() != Some(libc::EINPROGRESS)
         {
             unsafe { libc::close(fd) };
             return Err(err);
         }
 
-        let mut pollfd = libc::pollfd {
-            fd,
-            events: libc::POLLOUT,
-            revents: 0,
-        };
+        let mut pollfd = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
         let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
         let poll_ret = unsafe { libc::poll(&mut pollfd as *mut _, 1, timeout_ms) };
 
@@ -151,10 +146,7 @@ fn make_sockaddr_un(path: &Path) -> io::Result<libc::sockaddr_un> {
 
     let bytes = path.as_os_str().as_bytes();
     if bytes.len() >= 108 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "socket path too long",
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "socket path too long"));
     }
 
     let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };

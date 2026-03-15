@@ -33,9 +33,7 @@ fn start_mux_listener(state: Arc<mux::MuxState>) -> (PathBuf, tempfile::TempDir)
 /// Connect to a mux socket and request identities. Returns (nkeys, raw key_blobs).
 fn request_identities(sock_path: &std::path::Path) -> (u32, Vec<Vec<u8>>) {
     let mut stream = UnixStream::connect(sock_path).unwrap();
-    stream
-        .set_read_timeout(Some(TIMEOUT))
-        .unwrap();
+    stream.set_read_timeout(Some(TIMEOUT)).unwrap();
 
     proto::write_message(&mut stream, &[proto::SSH_AGENTC_REQUEST_IDENTITIES]).unwrap();
     let resp = proto::read_message(&mut stream).unwrap();
@@ -74,10 +72,7 @@ fn test_mux_merges_identities() {
     agent_a.add_key("key-from-a");
     agent_b.add_key("key-from-b");
 
-    let sockets = vec![
-        agent_a.sock_path().to_path_buf(),
-        agent_b.sock_path().to_path_buf(),
-    ];
+    let sockets = vec![agent_a.sock_path().to_path_buf(), agent_b.sock_path().to_path_buf()];
     let state = Arc::new(mux::build_mux_state_from_sockets(&sockets, TIMEOUT).unwrap());
     assert_eq!(state.key_map.len(), 2);
 
@@ -93,10 +88,7 @@ fn test_mux_routes_sign_request() {
     agent_a.add_key("sign-key-a");
     agent_b.add_key("sign-key-b");
 
-    let sockets = vec![
-        agent_a.sock_path().to_path_buf(),
-        agent_b.sock_path().to_path_buf(),
-    ];
+    let sockets = vec![agent_a.sock_path().to_path_buf(), agent_b.sock_path().to_path_buf()];
     let state = Arc::new(mux::build_mux_state_from_sockets(&sockets, TIMEOUT).unwrap());
 
     let (sock_path, _dir) = start_mux_listener(state);
@@ -114,16 +106,9 @@ fn test_mux_routes_sign_request() {
         proto::write_message(&mut stream, &msg).unwrap();
         let resp = proto::read_message(&mut stream).unwrap();
 
-        assert!(
-            !resp.is_empty(),
-            "empty response for sign request"
-        );
+        assert!(!resp.is_empty(), "empty response for sign request");
         // Type 14 = SSH_AGENT_SIGN_RESPONSE, type 5 = FAILURE
-        assert_eq!(
-            resp[0], 14,
-            "expected SIGN_RESPONSE (14), got {}",
-            resp[0]
-        );
+        assert_eq!(resp[0], 14, "expected SIGN_RESPONSE (14), got {}", resp[0]);
     }
 }
 
@@ -137,10 +122,7 @@ fn test_mux_deduplicates_keys() {
     let privkey = pubkey.with_extension(""); // remove .pub
     agent_b.add_key_file(&privkey);
 
-    let sockets = vec![
-        agent_a.sock_path().to_path_buf(),
-        agent_b.sock_path().to_path_buf(),
-    ];
+    let sockets = vec![agent_a.sock_path().to_path_buf(), agent_b.sock_path().to_path_buf()];
     let state = mux::build_mux_state_from_sockets(&sockets, TIMEOUT).unwrap();
 
     // Should have 1 key, not 2

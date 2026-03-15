@@ -66,11 +66,7 @@ pub fn build_mux_state_from_sockets(
         proto::put_string(&mut resp, comment);
     }
 
-    Ok(MuxState {
-        identities_response: resp,
-        key_map,
-        timeout,
-    })
+    Ok(MuxState { identities_response: resp, key_map, timeout })
 }
 
 pub fn handle_client(mut stream: UnixStream, state: &MuxState) {

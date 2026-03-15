@@ -1,0 +1,3 @@
+[[profile.default.overrides]]
+filter = 'binary(mux_test) | binary(probe_test)'
+retries = 2

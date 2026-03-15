@@ -1,4 +1,4 @@
-use crate::proto::{self, SSH2_AGENT_IDENTITIES_ANSWER, SSH_AGENTC_REQUEST_IDENTITIES};
+use crate::proto::{self, SSH_AGENTC_REQUEST_IDENTITIES, SSH2_AGENT_IDENTITIES_ANSWER};
 use base64::Engine;
 use sha2::Digest;
 use std::io::Write;
@@ -40,11 +40,7 @@ fn parse_identities(body: &[u8]) -> Option<Vec<Identity>> {
         let comment_bytes = proto::read_string(body, &mut pos)?;
         let comment = String::from_utf8_lossy(comment_bytes).into_owned();
 
-        identities.push(Identity {
-            key_type,
-            fingerprint: fingerprint(key_blob),
-            comment,
-        });
+        identities.push(Identity { key_type, fingerprint: fingerprint(key_blob), comment });
     }
 
     Some(identities)

@@ -27,18 +27,11 @@ impl TestAgent {
         // Wait for the socket to appear
         for _ in 0..50 {
             if sock_path.exists() {
-                return Self {
-                    child,
-                    dir,
-                    sock_path,
-                };
+                return Self { child, dir, sock_path };
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        panic!(
-            "ssh-agent socket never appeared at {}",
-            sock_path.display()
-        );
+        panic!("ssh-agent socket never appeared at {}", sock_path.display());
     }
 
     /// Generate an ed25519 key and add it to this agent. Returns the public key path.
@@ -100,8 +93,5 @@ pub fn ssh_keygen_fingerprint(pubkey_path: &Path) -> String {
     assert!(output.status.success());
     let line = String::from_utf8(output.stdout).unwrap();
     // Format: "256 SHA256:xxx comment (ED25519)"
-    line.split_whitespace()
-        .nth(1)
-        .expect("fingerprint field")
-        .to_string()
+    line.split_whitespace().nth(1).expect("fingerprint field").to_string()
 }

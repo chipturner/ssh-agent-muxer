@@ -33,11 +33,7 @@ fn read_proc_env(pid: u32) -> Option<ProcEnv> {
         }
     }
 
-    Some(ProcEnv {
-        pid,
-        ssh_auth_sock,
-        ssh_agent_pid,
-    })
+    Some(ProcEnv { pid, ssh_auth_sock, ssh_agent_pid })
 }
 
 pub fn discover() -> anyhow::Result<Discovery> {
@@ -62,8 +58,5 @@ pub fn discover() -> anyhow::Result<Discovery> {
         }
     }
 
-    Ok(Discovery {
-        sockets,
-        agent_pids,
-    })
+    Ok(Discovery { sockets, agent_pids })
 }

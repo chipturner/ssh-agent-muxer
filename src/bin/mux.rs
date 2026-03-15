@@ -1,4 +1,4 @@
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use clap::Parser;
 use ssh_agent_fixer::{discover, mux, proto};
 use std::io::Write;
@@ -72,19 +72,12 @@ fn main() -> anyhow::Result<()> {
     eprintln!(
         "Discovered {} keys across {} backends",
         state.key_map.len(),
-        state
-            .key_map
-            .values()
-            .collect::<std::collections::HashSet<_>>()
-            .len()
+        state.key_map.values().collect::<std::collections::HashSet<_>>().len()
     );
 
     let (listener, sock_path, temp_dir) = create_socket(cli.socket.as_deref())?;
 
-    println!(
-        "SSH_AUTH_SOCK={}; export SSH_AUTH_SOCK;",
-        sock_path.display()
-    );
+    println!("SSH_AUTH_SOCK={}; export SSH_AUTH_SOCK;", sock_path.display());
     eprintln!("Listening on {}", sock_path.display());
 
     let cleanup_path = sock_path.clone();
