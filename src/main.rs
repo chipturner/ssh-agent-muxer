@@ -2,6 +2,8 @@ mod discover;
 mod probe;
 
 use clap::Parser;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::path::PathBuf;
 use std::time::Duration;
 
 #[derive(Parser)]
@@ -16,8 +18,8 @@ struct Cli {
     alive_only: bool,
 }
 
-fn format_pids(pids: &std::collections::HashSet<u32>) -> String {
-    let mut sorted: Vec<_> = pids.iter().collect();
+fn format_pids(pids: &HashSet<u32>) -> String {
+    let mut sorted: Vec<_> = pids.iter().copied().collect();
     sorted.sort();
     sorted
         .iter()
@@ -26,69 +28,126 @@ fn format_pids(pids: &std::collections::HashSet<u32>) -> String {
         .join(", ")
 }
 
+fn section(title: &str) {
+    let pad = 54usize.saturating_sub(title.len() + 1);
+    println!("\n── {title} {}", "─".repeat(pad));
+}
+
+struct ProbeResult {
+    path: PathBuf,
+    pids: HashSet<u32>,
+    status: probe::AgentStatus,
+}
+
+fn print_agents(results: &[ProbeResult], alive_only: bool) {
+    section("Agents");
+
+    for r in results {
+        let pids = format_pids(&r.pids);
+        match &r.status {
+            probe::AgentStatus::Alive(ids) => {
+                let n = ids.len();
+                let label = if n == 1 { "key" } else { "keys" };
+                println!("  \x1b[32m●\x1b[0m {}  \x1b[2m{n} {label}  PIDs: {pids}\x1b[0m", r.path.display());
+            }
+            probe::AgentStatus::Dead(reason) if !alive_only => {
+                println!("  \x1b[31m●\x1b[0m {}  \x1b[2m{reason}  PIDs: {pids}\x1b[0m", r.path.display());
+            }
+            probe::AgentStatus::PermissionDenied if !alive_only => {
+                println!("  \x1b[33m●\x1b[0m {}  \x1b[2mpermission denied  PIDs: {pids}\x1b[0m", r.path.display());
+            }
+            _ => {}
+        }
+    }
+}
+
+fn print_keys(results: &[ProbeResult]) {
+    // fingerprint -> (key_type, comment, set of socket paths)
+    let mut keys: BTreeMap<String, (String, String, BTreeSet<String>)> = BTreeMap::new();
+
+    for r in results {
+        if let probe::AgentStatus::Alive(ids) = &r.status {
+            for id in ids {
+                let entry = keys
+                    .entry(id.fingerprint.clone())
+                    .or_insert_with(|| (id.key_type.clone(), id.comment.clone(), BTreeSet::new()));
+                entry.2.insert(r.path.display().to_string());
+            }
+        }
+    }
+
+    if keys.is_empty() {
+        return;
+    }
+
+    section("Keys");
+
+    for (fp, (key_type, comment, agents)) in &keys {
+        let label = if comment.is_empty() {
+            key_type.clone()
+        } else {
+            format!("{comment} ({key_type})")
+        };
+        println!("  {fp}  {label}");
+        let agents: Vec<_> = agents.iter().collect();
+        for (i, agent) in agents.iter().enumerate() {
+            let connector = if i + 1 < agents.len() { "├" } else { "└" };
+            println!("    {connector} {agent}");
+        }
+    }
+}
+
+fn print_stale_pids(discovery: &discover::Discovery) {
+    let mut stale = Vec::new();
+    for (&agent_pid, pids) in &discovery.agent_pids {
+        if !probe::pid_alive(agent_pid) {
+            stale.push((agent_pid, pids));
+        }
+    }
+
+    if stale.is_empty() {
+        return;
+    }
+
+    stale.sort_by_key(|(pid, _)| *pid);
+    section("Stale Agent PIDs");
+
+    for (agent_pid, pids) in stale {
+        println!(
+            "  \x1b[31m●\x1b[0m PID {agent_pid}  \x1b[2mprocess not found  PIDs: {}\x1b[0m",
+            format_pids(pids),
+        );
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let timeout = Duration::from_secs(cli.timeout);
 
     let discovery = discover::discover()?;
 
-    let mut any_alive = false;
+    let mut results: Vec<ProbeResult> = discovery
+        .sockets
+        .iter()
+        .map(|(path, pids)| ProbeResult {
+            path: path.clone(),
+            pids: pids.clone(),
+            status: probe::probe_agent(path, timeout),
+        })
+        .collect();
+    results.sort_by(|a, b| a.path.cmp(&b.path));
 
-    // Probe each unique socket
-    let mut socket_paths: Vec<_> = discovery.sockets.keys().collect();
-    socket_paths.sort();
+    let any_alive = results
+        .iter()
+        .any(|r| matches!(r.status, probe::AgentStatus::Alive(_)));
 
-    for path in socket_paths {
-        let pids = &discovery.sockets[path];
-        let status = probe::probe_agent(path, timeout);
+    print_agents(&results, cli.alive_only);
+    print_keys(&results);
 
-        match &status {
-            probe::AgentStatus::Alive { num_identities } => {
-                any_alive = true;
-                let n = *num_identities;
-                let label = if n == 1 { "identity" } else { "identities" };
-                println!(
-                    "ALIVE {}  ({n} {label}, referenced by PIDs: {})",
-                    path.display(),
-                    format_pids(pids),
-                );
-            }
-            probe::AgentStatus::Dead(reason) => {
-                if !cli.alive_only {
-                    println!(
-                        "DEAD  {}  ({reason}, referenced by PIDs: {})",
-                        path.display(),
-                        format_pids(pids),
-                    );
-                }
-            }
-            probe::AgentStatus::PermissionDenied => {
-                if !cli.alive_only {
-                    println!(
-                        "DENY  {}  (permission denied, referenced by PIDs: {})",
-                        path.display(),
-                        format_pids(pids),
-                    );
-                }
-            }
-        }
-    }
-
-    // Check for stale SSH_AGENT_PIDs
     if !cli.alive_only {
-        let mut agent_pids: Vec<_> = discovery.agent_pids.keys().collect();
-        agent_pids.sort();
-
-        for &agent_pid in &agent_pids {
-            if !probe::pid_alive(*agent_pid) {
-                let pids = &discovery.agent_pids[&agent_pid];
-                println!(
-                    "STALE SSH_AGENT_PID={agent_pid} (process not found, referenced by PIDs: {})",
-                    format_pids(pids),
-                );
-            }
-        }
+        print_stale_pids(&discovery);
     }
 
+    println!();
     std::process::exit(if any_alive { 0 } else { 1 });
 }

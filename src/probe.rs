@@ -1,3 +1,5 @@
+use base64::Engine;
+use sha2::Digest;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -6,9 +8,16 @@ use std::time::Duration;
 const SSH_AGENTC_REQUEST_IDENTITIES: u8 = 11;
 const SSH2_AGENT_IDENTITIES_ANSWER: u8 = 12;
 
+#[derive(Debug, Clone)]
+pub struct Identity {
+    pub key_type: String,
+    pub fingerprint: String,
+    pub comment: String,
+}
+
 #[derive(Debug)]
 pub enum AgentStatus {
-    Alive { num_identities: u32 },
+    Alive(Vec<Identity>),
     Dead(String),
     PermissionDenied,
 }
@@ -25,7 +34,6 @@ fn connect_timeout(path: &Path, timeout: Duration) -> std::io::Result<UnixStream
         return Err(std::io::Error::last_os_error());
     }
 
-    // Initiate non-blocking connect
     let ret = unsafe {
         libc::connect(
             fd,
@@ -43,7 +51,6 @@ fn connect_timeout(path: &Path, timeout: Duration) -> std::io::Result<UnixStream
             return Err(err);
         }
 
-        // Poll for connect completion
         let mut pollfd = libc::pollfd {
             fd,
             events: libc::POLLOUT,
@@ -64,7 +71,6 @@ fn connect_timeout(path: &Path, timeout: Duration) -> std::io::Result<UnixStream
             };
         }
 
-        // Check for connect error via SO_ERROR
         let mut err_code: libc::c_int = 0;
         let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
         unsafe {
@@ -82,13 +88,11 @@ fn connect_timeout(path: &Path, timeout: Duration) -> std::io::Result<UnixStream
         }
     }
 
-    // Switch back to blocking mode
     unsafe {
         let flags = libc::fcntl(fd, libc::F_GETFL);
         libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
     }
 
-    // SAFETY: fd is a valid, connected Unix stream socket
     Ok(unsafe { UnixStream::from_raw_fd(fd) })
 }
 
@@ -111,6 +115,61 @@ fn make_sockaddr_un(path: &Path) -> std::io::Result<libc::sockaddr_un> {
     Ok(addr)
 }
 
+/// Read a u32 big-endian from a byte slice, advancing the cursor.
+fn read_u32(buf: &[u8], pos: &mut usize) -> Option<u32> {
+    let end = *pos + 4;
+    if end > buf.len() {
+        return None;
+    }
+    let val = u32::from_be_bytes(buf[*pos..end].try_into().ok()?);
+    *pos = end;
+    Some(val)
+}
+
+/// Read a length-prefixed byte string from the wire format.
+fn read_string<'a>(buf: &'a [u8], pos: &mut usize) -> Option<&'a [u8]> {
+    let len = read_u32(buf, pos)? as usize;
+    let end = *pos + len;
+    if end > buf.len() {
+        return None;
+    }
+    let val = &buf[*pos..end];
+    *pos = end;
+    Some(val)
+}
+
+fn fingerprint(key_blob: &[u8]) -> String {
+    let hash = sha2::Sha256::digest(key_blob);
+    let b64 = base64::engine::general_purpose::STANDARD_NO_PAD.encode(hash);
+    format!("SHA256:{b64}")
+}
+
+fn parse_identities(body: &[u8]) -> Option<Vec<Identity>> {
+    let mut pos = 0;
+    let nkeys = read_u32(body, &mut pos)?;
+    let mut identities = Vec::with_capacity(nkeys as usize);
+
+    for _ in 0..nkeys {
+        let key_blob = read_string(body, &mut pos)?;
+
+        // Key type is the first string inside the key blob
+        let mut blob_pos = 0;
+        let key_type_bytes = read_string(key_blob, &mut blob_pos)?;
+        let key_type = String::from_utf8_lossy(key_type_bytes).into_owned();
+
+        let comment_bytes = read_string(body, &mut pos)?;
+        let comment = String::from_utf8_lossy(comment_bytes).into_owned();
+
+        identities.push(Identity {
+            key_type,
+            fingerprint: fingerprint(key_blob),
+            comment,
+        });
+    }
+
+    Some(identities)
+}
+
 pub fn probe_agent(path: &Path, timeout: Duration) -> AgentStatus {
     let mut stream = match connect_timeout(path, timeout) {
         Ok(s) => s,
@@ -129,25 +188,31 @@ pub fn probe_agent(path: &Path, timeout: Duration) -> AgentStatus {
         return AgentStatus::Dead(e.to_string());
     }
 
-    // Read response header: 4-byte length + 1-byte type
-    let mut header = [0u8; 5];
-    if let Err(e) = stream.read_exact(&mut header) {
+    // Read response: 4-byte length + body
+    let mut len_buf = [0u8; 4];
+    if let Err(e) = stream.read_exact(&mut len_buf) {
+        return AgentStatus::Dead(e.to_string());
+    }
+    let resp_len = u32::from_be_bytes(len_buf) as usize;
+
+    // Sanity cap: 10 MiB -- agents shouldn't send more than this
+    if resp_len == 0 || resp_len > 10 * 1024 * 1024 {
+        return AgentStatus::Dead(format!("bad response length: {resp_len}"));
+    }
+
+    let mut body = vec![0u8; resp_len];
+    if let Err(e) = stream.read_exact(&mut body) {
         return AgentStatus::Dead(e.to_string());
     }
 
-    let msg_type = header[4];
-    if msg_type != SSH2_AGENT_IDENTITIES_ANSWER {
-        return AgentStatus::Dead(format!("unexpected message type: {msg_type}"));
+    // First byte is the message type
+    if body[0] != SSH2_AGENT_IDENTITIES_ANSWER {
+        return AgentStatus::Dead(format!("unexpected message type: {}", body[0]));
     }
 
-    // Read nkeys (u32 big-endian)
-    let mut nkeys_buf = [0u8; 4];
-    if let Err(e) = stream.read_exact(&mut nkeys_buf) {
-        return AgentStatus::Dead(e.to_string());
-    }
-
-    AgentStatus::Alive {
-        num_identities: u32::from_be_bytes(nkeys_buf),
+    match parse_identities(&body[1..]) {
+        Some(identities) => AgentStatus::Alive(identities),
+        None => AgentStatus::Dead("malformed identities response".into()),
     }
 }
 
