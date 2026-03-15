@@ -1,7 +1,5 @@
-mod discover;
-mod probe;
-
 use clap::Parser;
+use ssh_agent_fixer::{discover, probe};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -48,13 +46,22 @@ fn print_agents(results: &[ProbeResult], alive_only: bool) {
             probe::AgentStatus::Alive(ids) => {
                 let n = ids.len();
                 let label = if n == 1 { "key" } else { "keys" };
-                println!("  \x1b[32m●\x1b[0m {}  \x1b[2m{n} {label}  PIDs: {pids}\x1b[0m", r.path.display());
+                println!(
+                    "  \x1b[32m●\x1b[0m {}  \x1b[2m{n} {label}  PIDs: {pids}\x1b[0m",
+                    r.path.display()
+                );
             }
             probe::AgentStatus::Dead(reason) if !alive_only => {
-                println!("  \x1b[31m●\x1b[0m {}  \x1b[2m{reason}  PIDs: {pids}\x1b[0m", r.path.display());
+                println!(
+                    "  \x1b[31m●\x1b[0m {}  \x1b[2m{reason}  PIDs: {pids}\x1b[0m",
+                    r.path.display()
+                );
             }
             probe::AgentStatus::PermissionDenied if !alive_only => {
-                println!("  \x1b[33m●\x1b[0m {}  \x1b[2mpermission denied  PIDs: {pids}\x1b[0m", r.path.display());
+                println!(
+                    "  \x1b[33m●\x1b[0m {}  \x1b[2mpermission denied  PIDs: {pids}\x1b[0m",
+                    r.path.display()
+                );
             }
             _ => {}
         }
@@ -62,7 +69,6 @@ fn print_agents(results: &[ProbeResult], alive_only: bool) {
 }
 
 fn print_keys(results: &[ProbeResult]) {
-    // fingerprint -> (key_type, comment, set of socket paths)
     let mut keys: BTreeMap<String, (String, String, BTreeSet<String>)> = BTreeMap::new();
 
     for r in results {

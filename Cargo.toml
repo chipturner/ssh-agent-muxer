@@ -3,13 +3,21 @@ name = "ssh-agent-fixer"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "ssh_agent_fixer"
+
 [[bin]]
 name = "ssh-agent-probe"
-path = "src/main.rs"
+path = "src/bin/probe.rs"
+
+[[bin]]
+name = "ssh-agent-mux"
+path = "src/bin/mux.rs"
 
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
+ctrlc = "3"
 libc = "0.2"
 sha2 = "0.10"
