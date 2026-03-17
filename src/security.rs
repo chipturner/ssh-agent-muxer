@@ -100,11 +100,17 @@ mod tests {
         assert!(check_peer_uid(&server).is_ok());
     }
 
+    fn chmod_socket(path: &std::path::Path, mode: u32) {
+        let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        unsafe { libc::chmod(c_path.as_ptr(), mode) };
+    }
+
     #[test]
     fn test_validate_own_socket() {
         let dir = tempfile::tempdir().unwrap();
         let sock_path = dir.path().join("test.sock");
         let _listener = UnixListener::bind(&sock_path).unwrap();
+        chmod_socket(&sock_path, 0o600);
 
         assert!(validate_backend_socket(&sock_path).is_ok());
     }
@@ -114,12 +120,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sock_path = dir.path().join("test.sock");
         let _listener = UnixListener::bind(&sock_path).unwrap();
-
-        // Make world-writable
-        unsafe {
-            let c_path = std::ffi::CString::new(sock_path.as_os_str().as_encoded_bytes()).unwrap();
-            libc::chmod(c_path.as_ptr(), 0o777);
-        }
+        chmod_socket(&sock_path, 0o777);
 
         let err = validate_backend_socket(&sock_path).unwrap_err();
         assert!(err.contains("world-writable"), "got: {err}");
@@ -130,12 +131,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sock_path = dir.path().join("test.sock");
         let _listener = UnixListener::bind(&sock_path).unwrap();
-
-        // Make world-readable but not world-writable
-        unsafe {
-            let c_path = std::ffi::CString::new(sock_path.as_os_str().as_encoded_bytes()).unwrap();
-            libc::chmod(c_path.as_ptr(), 0o744);
-        }
+        chmod_socket(&sock_path, 0o744);
 
         let err = validate_backend_socket(&sock_path).unwrap_err();
         assert!(err.contains("world-readable"), "got: {err}");
