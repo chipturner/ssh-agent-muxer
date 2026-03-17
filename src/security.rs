@@ -45,6 +45,7 @@ pub fn get_peer_cred(stream: &UnixStream) -> io::Result<(u32, u32, u32)> {
         return Err(io::Error::last_os_error());
     }
 
+    #[allow(clippy::unnecessary_cast)] // ucred field types vary across libc versions
     Ok((cred.pid as u32, cred.uid as u32, cred.gid as u32))
 }
 
