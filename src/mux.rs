@@ -1,10 +1,9 @@
 use crate::proto;
-use sha2::{Digest, Sha256};
+use arc_swap::ArcSwap;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -17,10 +16,6 @@ pub struct MuxState {
     /// Agent to forward add operations to. If None, adds return FAILURE.
     pub primary_agent: Option<PathBuf>,
 }
-
-/// Mux-level lock state. Lives outside MuxState so it persists across ArcSwap refreshes.
-/// Some(sha256_hash) when locked, None when unlocked.
-pub type LockState = Mutex<Option<[u8; 32]>>;
 
 /// Build mux state, skipping backend sockets that fail security validation.
 pub fn build_mux_state_validated(
@@ -97,8 +92,6 @@ pub fn build_mux_state_from_sockets(
     Ok(MuxState { identities_response: resp, key_map, timeout, primary_agent: None })
 }
 
-// --- Empty identities response (used when locked) ---
-
 fn empty_identities() -> Vec<u8> {
     let mut resp = Vec::new();
     resp.push(proto::SSH2_AGENT_IDENTITIES_ANSWER);
@@ -109,11 +102,12 @@ fn empty_identities() -> Vec<u8> {
 // --- Client handling ---
 
 /// Handle a single client connection.
+/// Loads fresh state per message via ArcSwap so long-lived connections see refreshed keys.
 pub fn handle_client(
     mut stream: UnixStream,
-    state: &MuxState,
-    reload: Option<&AtomicBool>,
-    lock: Option<&LockState>,
+    state: &ArcSwap<MuxState>,
+    reload: &AtomicBool,
+    locked: &AtomicBool,
 ) {
     loop {
         let msg = match proto::read_message(&mut stream) {
@@ -126,28 +120,30 @@ pub fn handle_client(
             continue;
         }
 
-        let locked = lock.is_some_and(|l| l.lock().unwrap().is_some());
+        // Fresh state snapshot per message
+        let snap = state.load();
+        let is_locked = locked.load(Ordering::Relaxed);
 
         let response = match msg[0] {
             // Unlock is always allowed
-            proto::SSH_AGENTC_UNLOCK => handle_unlock(&msg, lock),
+            proto::SSH_AGENTC_UNLOCK => handle_unlock(&msg, &snap, locked, reload),
 
             // When locked, gate everything except unlock
-            _ if locked => match msg[0] {
+            _ if is_locked => match msg[0] {
                 proto::SSH_AGENTC_REQUEST_IDENTITIES => empty_identities(),
-                proto::SSH_AGENTC_LOCK => vec![proto::SSH_AGENT_FAILURE], // already locked
+                proto::SSH_AGENTC_LOCK => vec![proto::SSH_AGENT_FAILURE],
                 proto::SSH_AGENTC_EXTENSION => vec![proto::SSH_AGENT_EXTENSION_FAILURE],
                 _ => vec![proto::SSH_AGENT_FAILURE],
             },
 
             // Normal (unlocked) dispatch
-            proto::SSH_AGENTC_REQUEST_IDENTITIES => state.identities_response.clone(),
-            proto::SSH_AGENTC_SIGN_REQUEST => handle_sign_request(&msg, state, reload),
-            proto::SSH_AGENTC_EXTENSION => handle_extension(&msg, state, reload),
-            proto::SSH_AGENTC_LOCK => handle_lock(&msg, lock),
-            proto::SSH_AGENTC_REMOVE_IDENTITY => handle_remove_identity(&msg, state, reload),
-            proto::SSH_AGENTC_REMOVE_ALL_IDENTITIES => handle_remove_all(&msg, state, reload),
-            t if proto::is_add_operation(t) => handle_add(&msg, state, reload),
+            proto::SSH_AGENTC_REQUEST_IDENTITIES => snap.identities_response.clone(),
+            proto::SSH_AGENTC_SIGN_REQUEST => handle_sign_request(&msg, &snap, reload),
+            proto::SSH_AGENTC_EXTENSION => handle_extension(&msg, &snap, reload),
+            proto::SSH_AGENTC_LOCK => handle_lock(&msg, &snap, locked, reload),
+            proto::SSH_AGENTC_REMOVE_IDENTITY => handle_remove_identity(&msg, &snap, reload),
+            proto::SSH_AGENTC_REMOVE_ALL_IDENTITIES => handle_remove_all(&msg, &snap, reload),
+            t if proto::is_add_operation(t) => handle_add(&msg, &snap, reload),
             _ => vec![proto::SSH_AGENT_FAILURE],
         };
 
@@ -157,58 +153,62 @@ pub fn handle_client(
     }
 }
 
-// --- Lock/Unlock ---
+// --- Lock/Unlock (broadcast to all backends) ---
 
-fn handle_lock(msg: &[u8], lock: Option<&LockState>) -> Vec<u8> {
-    let Some(lock) = lock else {
-        return vec![proto::SSH_AGENT_FAILURE];
-    };
-    let mut pos = 1;
-    let Some(passphrase) = proto::read_string(msg, &mut pos) else {
-        return vec![proto::SSH_AGENT_FAILURE];
-    };
-
-    let hash = Sha256::digest(passphrase);
-    let mut guard = lock.lock().unwrap();
-    if guard.is_some() {
+fn handle_lock(msg: &[u8], state: &MuxState, locked: &AtomicBool, reload: &AtomicBool) -> Vec<u8> {
+    if locked.load(Ordering::Relaxed) {
         return vec![proto::SSH_AGENT_FAILURE]; // already locked
     }
-    *guard = Some(hash.into());
+
+    // Broadcast LOCK to all backends -- succeed only if all succeed
+    let backends: HashSet<&PathBuf> = state.key_map.values().collect();
+    for backend in &backends {
+        let resp = forward_to_backend(backend, msg, state.timeout, reload);
+        if resp.first() != Some(&proto::SSH_AGENT_SUCCESS) {
+            return vec![proto::SSH_AGENT_FAILURE];
+        }
+    }
+
+    locked.store(true, Ordering::Relaxed);
     vec![proto::SSH_AGENT_SUCCESS]
 }
 
-fn handle_unlock(msg: &[u8], lock: Option<&LockState>) -> Vec<u8> {
-    let Some(lock) = lock else {
-        return vec![proto::SSH_AGENT_FAILURE];
-    };
-    let mut pos = 1;
-    let Some(passphrase) = proto::read_string(msg, &mut pos) else {
-        return vec![proto::SSH_AGENT_FAILURE];
-    };
-
-    let hash: [u8; 32] = Sha256::digest(passphrase).into();
-    let mut guard = lock.lock().unwrap();
-    match *guard {
-        Some(stored) if stored == hash => {
-            *guard = None;
-            vec![proto::SSH_AGENT_SUCCESS]
-        }
-        _ => vec![proto::SSH_AGENT_FAILURE],
+fn handle_unlock(
+    msg: &[u8],
+    state: &MuxState,
+    locked: &AtomicBool,
+    reload: &AtomicBool,
+) -> Vec<u8> {
+    if !locked.load(Ordering::Relaxed) {
+        return vec![proto::SSH_AGENT_FAILURE]; // not locked
     }
+
+    // Broadcast UNLOCK to all backends -- succeed only if all succeed
+    let backends: HashSet<&PathBuf> = state.key_map.values().collect();
+    for backend in &backends {
+        let resp = forward_to_backend(backend, msg, state.timeout, reload);
+        if resp.first() != Some(&proto::SSH_AGENT_SUCCESS) {
+            return vec![proto::SSH_AGENT_FAILURE];
+        }
+    }
+
+    locked.store(false, Ordering::Relaxed);
+    set_reload(reload); // refresh to pick up unlocked keys
+    vec![proto::SSH_AGENT_SUCCESS]
 }
 
 // --- Write operations ---
 
-fn handle_add(msg: &[u8], state: &MuxState, reload: Option<&AtomicBool>) -> Vec<u8> {
+fn handle_add(msg: &[u8], state: &MuxState, reload: &AtomicBool) -> Vec<u8> {
     let Some(primary) = &state.primary_agent else {
         return vec![proto::SSH_AGENT_FAILURE];
     };
-    let response = forward_to_backend(primary, msg, state.timeout, None);
+    let response = forward_to_backend(primary, msg, state.timeout, reload);
     set_reload(reload);
     response
 }
 
-fn handle_remove_identity(msg: &[u8], state: &MuxState, reload: Option<&AtomicBool>) -> Vec<u8> {
+fn handle_remove_identity(msg: &[u8], state: &MuxState, reload: &AtomicBool) -> Vec<u8> {
     let mut pos = 1;
     let Some(key_blob) = proto::read_string(msg, &mut pos) else {
         return vec![proto::SSH_AGENT_FAILURE];
@@ -221,7 +221,7 @@ fn handle_remove_identity(msg: &[u8], state: &MuxState, reload: Option<&AtomicBo
     response
 }
 
-fn handle_remove_all(msg: &[u8], state: &MuxState, reload: Option<&AtomicBool>) -> Vec<u8> {
+fn handle_remove_all(msg: &[u8], state: &MuxState, reload: &AtomicBool) -> Vec<u8> {
     let backends: HashSet<&PathBuf> = state.key_map.values().collect();
     let mut any_success = false;
 
@@ -234,10 +234,7 @@ fn handle_remove_all(msg: &[u8], state: &MuxState, reload: Option<&AtomicBool>) 
 
     set_reload(reload);
 
-    if any_success {
-        vec![proto::SSH_AGENT_SUCCESS]
-    } else if state.key_map.is_empty() {
-        // No backends to remove from -- that's fine
+    if any_success || state.key_map.is_empty() {
         vec![proto::SSH_AGENT_SUCCESS]
     } else {
         vec![proto::SSH_AGENT_FAILURE]
@@ -246,7 +243,7 @@ fn handle_remove_all(msg: &[u8], state: &MuxState, reload: Option<&AtomicBool>) 
 
 // --- Sign + Extension ---
 
-fn handle_sign_request(msg: &[u8], state: &MuxState, reload: Option<&AtomicBool>) -> Vec<u8> {
+fn handle_sign_request(msg: &[u8], state: &MuxState, reload: &AtomicBool) -> Vec<u8> {
     let mut pos = 1;
     let Some(key_blob) = proto::read_string(msg, &mut pos) else {
         return vec![proto::SSH_AGENT_FAILURE];
@@ -257,7 +254,7 @@ fn handle_sign_request(msg: &[u8], state: &MuxState, reload: Option<&AtomicBool>
     forward_to_backend(backend_path, msg, state.timeout, reload)
 }
 
-fn handle_extension(msg: &[u8], state: &MuxState, reload: Option<&AtomicBool>) -> Vec<u8> {
+fn handle_extension(msg: &[u8], state: &MuxState, reload: &AtomicBool) -> Vec<u8> {
     let mut pos = 1;
     let Some(ext_name) = proto::read_string(msg, &mut pos) else {
         return vec![proto::SSH_AGENT_EXTENSION_FAILURE];
@@ -282,8 +279,15 @@ fn forward_to_backend(
     backend_path: &Path,
     msg: &[u8],
     timeout: Duration,
-    reload: Option<&AtomicBool>,
+    reload: &AtomicBool,
 ) -> Vec<u8> {
+    // Re-validate socket security before connecting (TOCTOU mitigation)
+    if let Err(reason) = crate::security::validate_backend_socket(backend_path) {
+        log::warn!("Backend rejected on connect: {}: {reason}", backend_path.display());
+        set_reload(reload);
+        return vec![proto::SSH_AGENT_FAILURE];
+    }
+
     let mut backend = match proto::agent_connect(backend_path, timeout) {
         Ok(s) => s,
         Err(_) => {
@@ -306,8 +310,6 @@ fn forward_to_backend(
     }
 }
 
-fn set_reload(reload: Option<&AtomicBool>) {
-    if let Some(flag) = reload {
-        flag.store(true, Ordering::Relaxed);
-    }
+fn set_reload(reload: &AtomicBool) {
+    reload.store(true, Ordering::Relaxed);
 }

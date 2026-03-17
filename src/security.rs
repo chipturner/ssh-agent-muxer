@@ -5,7 +5,8 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 
 /// Validate that a backend socket is safe to connect to.
-/// Must be owned by current user and not world-readable/writable.
+/// Must be owned by current user, not world-readable/writable,
+/// and parent directory must not be group/world-writable (unless sticky).
 pub fn validate_backend_socket(path: &Path) -> Result<(), String> {
     let meta = std::fs::symlink_metadata(path).map_err(|e| format!("{e}"))?;
     let uid = current_uid();
@@ -20,6 +21,20 @@ pub fn validate_backend_socket(path: &Path) -> Result<(), String> {
     }
     if mode & 0o004 != 0 {
         return Err("world-readable".into());
+    }
+
+    // Validate parent directory: reject if group/world-writable without sticky bit
+    if let Some(parent) = path.parent()
+        && let Ok(parent_meta) = std::fs::symlink_metadata(parent)
+    {
+        let pmode = parent_meta.mode();
+        let is_sticky = pmode & 0o1000 != 0;
+        if !is_sticky && (pmode & 0o022 != 0) {
+            return Err(format!(
+                "parent directory {} is group/world-writable without sticky bit",
+                parent.display()
+            ));
+        }
     }
 
     Ok(())

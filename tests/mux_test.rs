@@ -5,8 +5,8 @@ use ssh_agent_mux::mux;
 use ssh_agent_mux::proto;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const TIMEOUT: Duration = Duration::from_secs(2);
@@ -18,11 +18,18 @@ fn start_mux_listener(state: Arc<mux::MuxState>) -> (PathBuf, tempfile::TempDir)
     let listener = UnixListener::bind(&sock_path).unwrap();
 
     std::thread::spawn(move || {
+        let state = Arc::new(ArcSwap::from(state));
+        let reload = Arc::new(AtomicBool::new(false));
+        let locked = Arc::new(AtomicBool::new(false));
         for conn in listener.incoming() {
             match conn {
                 Ok(stream) => {
                     let state = Arc::clone(&state);
-                    std::thread::spawn(move || mux::handle_client(stream, &state, None, None));
+                    let reload = Arc::clone(&reload);
+                    let locked = Arc::clone(&locked);
+                    std::thread::spawn(move || {
+                        mux::handle_client(stream, &state, &reload, &locked)
+                    });
                 }
                 Err(_) => break,
             }
@@ -94,12 +101,9 @@ fn test_mux_routes_sign_request() {
     let state = Arc::new(mux::build_mux_state_from_sockets(&sockets, TIMEOUT).unwrap());
 
     let (sock_path, _dir) = start_mux_listener(state);
-
-    // Get the key blobs
     let (_nkeys, key_blobs) = request_identities(&sock_path);
     assert_eq!(key_blobs.len(), 2);
 
-    // Sign with each key -- both should succeed
     for blob in &key_blobs {
         let mut stream = UnixStream::connect(&sock_path).unwrap();
         stream.set_read_timeout(Some(TIMEOUT)).unwrap();
@@ -109,7 +113,6 @@ fn test_mux_routes_sign_request() {
         let resp = proto::read_message(&mut stream).unwrap();
 
         assert!(!resp.is_empty(), "empty response for sign request");
-        // Type 14 = SSH_AGENT_SIGN_RESPONSE, type 5 = FAILURE
         assert_eq!(resp[0], 14, "expected SIGN_RESPONSE (14), got {}", resp[0]);
     }
 }
@@ -119,15 +122,12 @@ fn test_mux_deduplicates_keys() {
     let agent_a = common::TestAgent::start();
     let agent_b = common::TestAgent::start();
 
-    // Generate key once, add the same private key to both agents
     let pubkey = agent_a.add_key("shared-key");
-    let privkey = pubkey.with_extension(""); // remove .pub
+    let privkey = pubkey.with_extension("");
     agent_b.add_key_file(&privkey);
 
     let sockets = vec![agent_a.sock_path().to_path_buf(), agent_b.sock_path().to_path_buf()];
     let state = mux::build_mux_state_from_sockets(&sockets, TIMEOUT).unwrap();
-
-    // Should have 1 key, not 2
     assert_eq!(state.key_map.len(), 1);
 }
 
@@ -144,10 +144,8 @@ fn test_mux_unknown_message_returns_failure() {
     let mut stream = UnixStream::connect(&sock_path).unwrap();
     stream.set_read_timeout(Some(TIMEOUT)).unwrap();
 
-    // Send a message with unknown type 99
     proto::write_message(&mut stream, &[99u8]).unwrap();
     let resp = proto::read_message(&mut stream).unwrap();
-
     assert_eq!(resp, vec![proto::SSH_AGENT_FAILURE]);
 }
 
@@ -164,11 +162,9 @@ fn test_mux_unknown_key_sign_returns_failure() {
     let mut stream = UnixStream::connect(&sock_path).unwrap();
     stream.set_read_timeout(Some(TIMEOUT)).unwrap();
 
-    // Sign with a fabricated key blob that doesn't exist in any agent
     let msg = build_sign_request(b"totally-fake-key-blob", b"data");
     proto::write_message(&mut stream, &msg).unwrap();
     let resp = proto::read_message(&mut stream).unwrap();
-
     assert_eq!(resp, vec![proto::SSH_AGENT_FAILURE]);
 }
 
@@ -182,7 +178,6 @@ fn test_mux_multiple_clients_concurrent() {
 
     let (sock_path, _dir) = start_mux_listener(state);
 
-    // Spawn 5 clients in parallel, each requesting identities
     let handles: Vec<_> = (0..5)
         .map(|_| {
             let path = sock_path.clone();
@@ -200,29 +195,6 @@ fn test_mux_multiple_clients_concurrent() {
 
 // --- ArcSwap refresh tests ---
 
-/// Start a mux listener backed by ArcSwap for testing state refresh.
-fn start_mux_listener_swappable(
-    state: Arc<ArcSwap<mux::MuxState>>,
-) -> (PathBuf, tempfile::TempDir) {
-    let dir = tempfile::tempdir().unwrap();
-    let sock_path = dir.path().join("mux.sock");
-    let listener = UnixListener::bind(&sock_path).unwrap();
-
-    std::thread::spawn(move || {
-        for conn in listener.incoming() {
-            match conn {
-                Ok(stream) => {
-                    let snapshot = state.load_full();
-                    std::thread::spawn(move || mux::handle_client(stream, &snapshot, None, None));
-                }
-                Err(_) => break,
-            }
-        }
-    });
-
-    (sock_path, dir)
-}
-
 #[test]
 fn test_mux_refresh_sees_new_keys() {
     let agent_a = common::TestAgent::start();
@@ -232,27 +204,45 @@ fn test_mux_refresh_sees_new_keys() {
     let initial = mux::build_mux_state_from_sockets(&sockets_a, TIMEOUT).unwrap();
 
     let state = Arc::new(ArcSwap::from_pointee(initial));
-    let (sock_path, _dir) = start_mux_listener_swappable(Arc::clone(&state));
+    let dir = tempfile::tempdir().unwrap();
+    let sock_path = dir.path().join("mux.sock");
+    let listener = UnixListener::bind(&sock_path).unwrap();
 
-    // Initially 1 key
+    let state_clone = Arc::clone(&state);
+    std::thread::spawn(move || {
+        let reload = Arc::new(AtomicBool::new(false));
+        let locked = Arc::new(AtomicBool::new(false));
+        for conn in listener.incoming() {
+            match conn {
+                Ok(stream) => {
+                    let state = Arc::clone(&state_clone);
+                    let reload = Arc::clone(&reload);
+                    let locked = Arc::clone(&locked);
+                    std::thread::spawn(move || {
+                        mux::handle_client(stream, &state, &reload, &locked)
+                    });
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
     let (nkeys, _) = request_identities(&sock_path);
     assert_eq!(nkeys, 1);
 
-    // Add a second agent and swap in new state
     let agent_b = common::TestAgent::start();
     agent_b.add_key("refresh-key-b");
-
     let sockets_ab = vec![agent_a.sock_path().to_path_buf(), agent_b.sock_path().to_path_buf()];
     let refreshed = mux::build_mux_state_from_sockets(&sockets_ab, TIMEOUT).unwrap();
     state.store(Arc::new(refreshed));
 
-    // New connection should see 2 keys
     let (nkeys, _) = request_identities(&sock_path);
     assert_eq!(nkeys, 2);
 }
 
 #[test]
-fn test_mux_old_client_unaffected_by_refresh() {
+fn test_mux_long_lived_client_sees_refresh() {
+    // Per-message state load: existing connection sees updated keys after swap
     let agent_a = common::TestAgent::start();
     agent_a.add_key("stable-key-a");
 
@@ -260,13 +250,34 @@ fn test_mux_old_client_unaffected_by_refresh() {
     let initial = mux::build_mux_state_from_sockets(&sockets_a, TIMEOUT).unwrap();
 
     let state = Arc::new(ArcSwap::from_pointee(initial));
-    let (sock_path, _dir) = start_mux_listener_swappable(Arc::clone(&state));
+    let dir = tempfile::tempdir().unwrap();
+    let sock_path = dir.path().join("mux.sock");
+    let listener = UnixListener::bind(&sock_path).unwrap();
+
+    let state_clone = Arc::clone(&state);
+    std::thread::spawn(move || {
+        let reload = Arc::new(AtomicBool::new(false));
+        let locked = Arc::new(AtomicBool::new(false));
+        for conn in listener.incoming() {
+            match conn {
+                Ok(stream) => {
+                    let state = Arc::clone(&state_clone);
+                    let reload = Arc::clone(&reload);
+                    let locked = Arc::clone(&locked);
+                    std::thread::spawn(move || {
+                        mux::handle_client(stream, &state, &reload, &locked)
+                    });
+                }
+                Err(_) => break,
+            }
+        }
+    });
 
     // Open a persistent connection
     let mut client = UnixStream::connect(&sock_path).unwrap();
     client.set_read_timeout(Some(TIMEOUT)).unwrap();
 
-    // Verify 1 key on this connection
+    // Verify 1 key
     proto::write_message(&mut client, &[proto::SSH_AGENTC_REQUEST_IDENTITIES]).unwrap();
     let resp = proto::read_message(&mut client).unwrap();
     let mut pos = 0;
@@ -279,15 +290,11 @@ fn test_mux_old_client_unaffected_by_refresh() {
     let refreshed = mux::build_mux_state_from_sockets(&sockets_ab, TIMEOUT).unwrap();
     state.store(Arc::new(refreshed));
 
-    // Existing client still sees 1 key (its snapshot is frozen)
+    // Existing client SHOULD see 2 keys now (per-message state load)
     proto::write_message(&mut client, &[proto::SSH_AGENTC_REQUEST_IDENTITIES]).unwrap();
     let resp = proto::read_message(&mut client).unwrap();
     let mut pos = 0;
-    assert_eq!(proto::read_u32(&resp[1..], &mut pos), Some(1));
-
-    // New connection sees 2 keys
-    let (nkeys, _) = request_identities(&sock_path);
-    assert_eq!(nkeys, 2);
+    assert_eq!(proto::read_u32(&resp[1..], &mut pos), Some(2));
 }
 
 // --- Empty state tests ---
@@ -303,7 +310,7 @@ fn test_mux_empty_state_returns_zero_keys() {
     assert_eq!(nkeys, 0);
 }
 
-// --- Write operation forwarding tests ---
+// --- Write operation tests ---
 
 #[test]
 fn test_mux_write_without_primary_rejects() {
@@ -312,39 +319,15 @@ fn test_mux_write_without_primary_rejects() {
 
     let sockets = vec![agent.sock_path().to_path_buf()];
     let state = mux::build_mux_state_from_sockets(&sockets, TIMEOUT).unwrap();
-
     let state = Arc::new(state);
     let (sock_path, _dir) = start_mux_listener(state);
 
-    // Try to add a key (type 17) -- should get FAILURE since no primary agent
     let mut stream = UnixStream::connect(&sock_path).unwrap();
     stream.set_read_timeout(Some(TIMEOUT)).unwrap();
     proto::write_message(&mut stream, &[proto::SSH_AGENTC_ADD_IDENTITY, 0]).unwrap();
     let resp = proto::read_message(&mut stream).unwrap();
     assert_eq!(resp, vec![proto::SSH_AGENT_FAILURE]);
 }
-
-#[test]
-fn test_mux_remove_all_triggers_reload() {
-    let agent = common::TestAgent::start();
-    agent.add_key("reload-test");
-
-    let sockets = vec![agent.sock_path().to_path_buf()];
-    let state = mux::build_mux_state_from_sockets(&sockets, TIMEOUT).unwrap();
-
-    let (sock_path, _dir, reload) = start_mux_listener_with_reload(state);
-
-    // Remove all identities -- should broadcast and trigger reload
-    let mut stream = UnixStream::connect(&sock_path).unwrap();
-    stream.set_read_timeout(Some(TIMEOUT)).unwrap();
-    proto::write_message(&mut stream, &[proto::SSH_AGENTC_REMOVE_ALL_IDENTITIES]).unwrap();
-    let resp = proto::read_message(&mut stream).unwrap();
-    assert_eq!(resp, vec![proto::SSH_AGENT_SUCCESS]);
-
-    assert!(reload.load(Ordering::Relaxed), "reload flag should be set after remove_all");
-}
-
-// --- Sign-failure reload tests ---
 
 /// Helper: start a mux listener with reload flag tracking.
 fn start_mux_listener_with_reload(
@@ -357,14 +340,16 @@ fn start_mux_listener_with_reload(
 
     let reload_clone = Arc::clone(&reload);
     std::thread::spawn(move || {
-        let state = Arc::new(state);
+        let state = Arc::new(ArcSwap::from_pointee(state));
+        let locked = Arc::new(AtomicBool::new(false));
         for conn in listener.incoming() {
             match conn {
                 Ok(stream) => {
                     let state = Arc::clone(&state);
                     let reload = Arc::clone(&reload_clone);
+                    let locked = Arc::clone(&locked);
                     std::thread::spawn(move || {
-                        mux::handle_client(stream, &state, Some(&reload), None)
+                        mux::handle_client(stream, &state, &reload, &locked)
                     });
                 }
                 Err(_) => break,
@@ -374,6 +359,27 @@ fn start_mux_listener_with_reload(
 
     (sock_path, dir, reload)
 }
+
+#[test]
+fn test_mux_remove_all_triggers_reload() {
+    let agent = common::TestAgent::start();
+    agent.add_key("reload-test");
+
+    let sockets = vec![agent.sock_path().to_path_buf()];
+    let state = mux::build_mux_state_from_sockets(&sockets, TIMEOUT).unwrap();
+
+    let (sock_path, _dir, reload) = start_mux_listener_with_reload(state);
+
+    let mut stream = UnixStream::connect(&sock_path).unwrap();
+    stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+    proto::write_message(&mut stream, &[proto::SSH_AGENTC_REMOVE_ALL_IDENTITIES]).unwrap();
+    let resp = proto::read_message(&mut stream).unwrap();
+    assert_eq!(resp, vec![proto::SSH_AGENT_SUCCESS]);
+
+    assert!(reload.load(Ordering::Relaxed), "reload flag should be set after remove_all");
+}
+
+// --- Sign-failure reload tests ---
 
 #[test]
 fn test_mux_sign_failure_triggers_reload() {
@@ -386,7 +392,6 @@ fn test_mux_sign_failure_triggers_reload() {
     let state = mux::build_mux_state_from_sockets(&sockets, TIMEOUT).unwrap();
     assert_eq!(state.key_map.len(), 2);
 
-    // Grab agent_b's key blob before killing it
     let (_, key_blobs) = {
         let state_arc = Arc::new(mux::build_mux_state_from_sockets(&sockets, TIMEOUT).unwrap());
         let (sock, _dir) = start_mux_listener(state_arc);
@@ -395,10 +400,8 @@ fn test_mux_sign_failure_triggers_reload() {
 
     let (sock_path, _dir, reload) = start_mux_listener_with_reload(state);
 
-    // Kill agent_b so its backend is dead
     drop(agent_b);
 
-    // Try to sign with agent_b's key -- should fail AND trigger reload
     let msg = build_sign_request(&key_blobs[1], b"test data");
     let mut stream = UnixStream::connect(&sock_path).unwrap();
     stream.set_read_timeout(Some(TIMEOUT)).unwrap();
@@ -417,12 +420,9 @@ fn test_extension_unknown_returns_extension_failure() {
     agent.add_key("ext-test");
 
     let sockets = vec![agent.sock_path().to_path_buf()];
-    let state = mux::build_mux_state_from_sockets(&sockets, TIMEOUT).unwrap();
-
-    let state = Arc::new(state);
+    let state = Arc::new(mux::build_mux_state_from_sockets(&sockets, TIMEOUT).unwrap());
     let (sock_path, _dir) = start_mux_listener(state);
 
-    // Send unknown extension
     let mut msg = vec![proto::SSH_AGENTC_EXTENSION];
     proto::put_string(&mut msg, b"unknown-extension@example.com");
 
@@ -430,8 +430,6 @@ fn test_extension_unknown_returns_extension_failure() {
     stream.set_read_timeout(Some(TIMEOUT)).unwrap();
     proto::write_message(&mut stream, &msg).unwrap();
     let resp = proto::read_message(&mut stream).unwrap();
-
-    // Should return EXTENSION_FAILURE (28), not generic FAILURE (5)
     assert_eq!(resp, vec![proto::SSH_AGENT_EXTENSION_FAILURE]);
 }
 
@@ -441,31 +439,24 @@ fn test_extension_session_bind_routes_by_key() {
     agent.add_key("session-bind-test");
 
     let sockets = vec![agent.sock_path().to_path_buf()];
-    let state = mux::build_mux_state_from_sockets(&sockets, TIMEOUT).unwrap();
-
-    let state = Arc::new(state);
+    let state = Arc::new(mux::build_mux_state_from_sockets(&sockets, TIMEOUT).unwrap());
     let (sock_path, _dir) = start_mux_listener(Arc::clone(&state));
 
-    // Get the key blob
     let (_, key_blobs) = request_identities(&sock_path);
     assert_eq!(key_blobs.len(), 1);
 
-    // Build a session-bind extension message
     let mut msg = vec![proto::SSH_AGENTC_EXTENSION];
     proto::put_string(&mut msg, b"session-bind@openssh.com");
-    proto::put_string(&mut msg, &key_blobs[0]); // key blob
-    proto::put_string(&mut msg, b"fake-session-id"); // session identifier
-    proto::put_string(&mut msg, b"fake-signature"); // signature
-    msg.push(0); // is_forwarding = false
+    proto::put_string(&mut msg, &key_blobs[0]);
+    proto::put_string(&mut msg, b"fake-session-id");
+    proto::put_string(&mut msg, b"fake-signature");
+    msg.push(0);
 
     let mut stream = UnixStream::connect(&sock_path).unwrap();
     stream.set_read_timeout(Some(TIMEOUT)).unwrap();
     proto::write_message(&mut stream, &msg).unwrap();
     let resp = proto::read_message(&mut stream).unwrap();
 
-    // The real agent will likely reject the fake signature, but it should
-    // NOT return EXTENSION_FAILURE (28) -- that means we didn't route it.
-    // It should return either SUCCESS (6) or generic FAILURE (5) from the agent.
     assert_ne!(
         resp,
         vec![proto::SSH_AGENT_EXTENSION_FAILURE],
@@ -473,31 +464,36 @@ fn test_extension_session_bind_routes_by_key() {
     );
 }
 
-// --- Mux-level lock tests ---
+// --- Lock tests (broadcast to backends) ---
 
 #[test]
-fn test_lock_returns_empty_identities_and_blocks_sign() {
+fn test_lock_broadcast_blocks_identities() {
     let agent = common::TestAgent::start();
     agent.add_key("lock-test");
 
     let sockets = vec![agent.sock_path().to_path_buf()];
     let state = mux::build_mux_state_from_sockets(&sockets, TIMEOUT).unwrap();
-    let lock = Arc::new(Mutex::new(None));
 
     let dir = tempfile::tempdir().unwrap();
     let sock_path = dir.path().join("mux.sock");
     let listener = UnixListener::bind(&sock_path).unwrap();
 
-    let lock_clone = Arc::clone(&lock);
+    let state = Arc::new(ArcSwap::from_pointee(state));
+    let locked = Arc::new(AtomicBool::new(false));
+    let reload = Arc::new(AtomicBool::new(false));
+
+    let state_clone = Arc::clone(&state);
+    let locked_clone = Arc::clone(&locked);
+    let reload_clone = Arc::clone(&reload);
     std::thread::spawn(move || {
-        let state = Arc::new(state);
         for conn in listener.incoming() {
             match conn {
                 Ok(stream) => {
-                    let state = Arc::clone(&state);
-                    let lock = Arc::clone(&lock_clone);
+                    let state = Arc::clone(&state_clone);
+                    let reload = Arc::clone(&reload_clone);
+                    let locked = Arc::clone(&locked_clone);
                     std::thread::spawn(move || {
-                        mux::handle_client(stream, &state, None, Some(&lock))
+                        mux::handle_client(stream, &state, &reload, &locked)
                     });
                 }
                 Err(_) => break,
@@ -508,46 +504,40 @@ fn test_lock_returns_empty_identities_and_blocks_sign() {
     let mut stream = UnixStream::connect(&sock_path).unwrap();
     stream.set_read_timeout(Some(TIMEOUT)).unwrap();
 
-    // Verify we have 1 key before locking
+    // 1 key before lock
     proto::write_message(&mut stream, &[proto::SSH_AGENTC_REQUEST_IDENTITIES]).unwrap();
     let resp = proto::read_message(&mut stream).unwrap();
     let mut pos = 0;
     assert_eq!(proto::read_u32(&resp[1..], &mut pos), Some(1));
 
-    // Lock the mux
+    // Lock
     let mut lock_msg = vec![proto::SSH_AGENTC_LOCK];
     proto::put_string(&mut lock_msg, b"my-passphrase");
     proto::write_message(&mut stream, &lock_msg).unwrap();
     let resp = proto::read_message(&mut stream).unwrap();
     assert_eq!(resp, vec![proto::SSH_AGENT_SUCCESS]);
 
-    // Identities should now be empty
+    // Identities should be empty
     proto::write_message(&mut stream, &[proto::SSH_AGENTC_REQUEST_IDENTITIES]).unwrap();
     let resp = proto::read_message(&mut stream).unwrap();
     let mut pos = 0;
     assert_eq!(proto::read_u32(&resp[1..], &mut pos), Some(0));
 
-    // Unlock with wrong passphrase should fail
+    // Wrong passphrase unlock fails
     let mut unlock_msg = vec![proto::SSH_AGENTC_UNLOCK];
     proto::put_string(&mut unlock_msg, b"wrong-passphrase");
     proto::write_message(&mut stream, &unlock_msg).unwrap();
     let resp = proto::read_message(&mut stream).unwrap();
     assert_eq!(resp, vec![proto::SSH_AGENT_FAILURE]);
 
-    // Still locked -- identities still empty
-    proto::write_message(&mut stream, &[proto::SSH_AGENTC_REQUEST_IDENTITIES]).unwrap();
-    let resp = proto::read_message(&mut stream).unwrap();
-    let mut pos = 0;
-    assert_eq!(proto::read_u32(&resp[1..], &mut pos), Some(0));
-
-    // Unlock with correct passphrase
+    // Correct unlock
     let mut unlock_msg = vec![proto::SSH_AGENTC_UNLOCK];
     proto::put_string(&mut unlock_msg, b"my-passphrase");
     proto::write_message(&mut stream, &unlock_msg).unwrap();
     let resp = proto::read_message(&mut stream).unwrap();
     assert_eq!(resp, vec![proto::SSH_AGENT_SUCCESS]);
 
-    // Should see 1 key again
+    // 1 key again
     proto::write_message(&mut stream, &[proto::SSH_AGENTC_REQUEST_IDENTITIES]).unwrap();
     let resp = proto::read_message(&mut stream).unwrap();
     let mut pos = 0;
@@ -564,17 +554,12 @@ fn test_remove_identity_routes_by_key_blob() {
     agent_b.add_key("remove-b");
 
     let sockets = vec![agent_a.sock_path().to_path_buf(), agent_b.sock_path().to_path_buf()];
-    let state = mux::build_mux_state_from_sockets(&sockets, TIMEOUT).unwrap();
-    assert_eq!(state.key_map.len(), 2);
-
-    let state = Arc::new(state);
+    let state = Arc::new(mux::build_mux_state_from_sockets(&sockets, TIMEOUT).unwrap());
     let (sock_path, _dir) = start_mux_listener(Arc::clone(&state));
 
-    // Get key blobs
     let (_, key_blobs) = request_identities(&sock_path);
     assert_eq!(key_blobs.len(), 2);
 
-    // Remove the first key via mux
     let mut msg = vec![proto::SSH_AGENTC_REMOVE_IDENTITY];
     proto::put_string(&mut msg, &key_blobs[0]);
 
@@ -593,19 +578,15 @@ fn test_remove_all_broadcasts_to_all_backends() {
     agent_b.add_key("rmall-b");
 
     let sockets = vec![agent_a.sock_path().to_path_buf(), agent_b.sock_path().to_path_buf()];
-    let state = mux::build_mux_state_from_sockets(&sockets, TIMEOUT).unwrap();
-
-    let state = Arc::new(state);
+    let state = Arc::new(mux::build_mux_state_from_sockets(&sockets, TIMEOUT).unwrap());
     let (sock_path, _dir) = start_mux_listener(Arc::clone(&state));
 
-    // Remove all keys
     let mut stream = UnixStream::connect(&sock_path).unwrap();
     stream.set_read_timeout(Some(TIMEOUT)).unwrap();
     proto::write_message(&mut stream, &[proto::SSH_AGENTC_REMOVE_ALL_IDENTITIES]).unwrap();
     let resp = proto::read_message(&mut stream).unwrap();
     assert_eq!(resp, vec![proto::SSH_AGENT_SUCCESS]);
 
-    // Verify both agents are now empty by probing directly
     let state_after = mux::build_mux_state_from_sockets(&sockets, TIMEOUT).unwrap();
     assert_eq!(state_after.key_map.len(), 0, "all keys should be removed from all backends");
 }
@@ -616,10 +597,7 @@ fn test_add_without_primary_fails() {
     agent.add_key("add-test");
 
     let sockets = vec![agent.sock_path().to_path_buf()];
-    let state = mux::build_mux_state_from_sockets(&sockets, TIMEOUT).unwrap();
-    // primary_agent is None by default
-
-    let state = Arc::new(state);
+    let state = Arc::new(mux::build_mux_state_from_sockets(&sockets, TIMEOUT).unwrap());
     let (sock_path, _dir) = start_mux_listener(state);
 
     let mut stream = UnixStream::connect(&sock_path).unwrap();

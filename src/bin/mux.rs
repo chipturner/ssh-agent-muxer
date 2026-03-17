@@ -6,8 +6,8 @@ use ssh_agent_mux::{control, discover, mux, proto, security, watch};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::{fs, io, thread};
 
@@ -26,6 +26,8 @@ enum Command {
     Status(CtlArgs),
     /// Trigger immediate agent rediscovery
     Refresh(CtlArgs),
+    /// Stop the running daemon
+    Stop(CtlArgs),
 }
 
 #[derive(Args)]
@@ -68,6 +70,10 @@ struct CtlArgs {
     /// Socket directory (to find control.sock)
     #[arg(short, long)]
     socket_dir: Option<PathBuf>,
+
+    /// Emit raw JSON (status only)
+    #[arg(long)]
+    json: bool,
 }
 
 // --- Path helpers ---
@@ -85,6 +91,12 @@ fn runtime_dir() -> PathBuf {
 }
 
 fn default_socket_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("SSH_AGENT_MUX_SOCKET") {
+        let p = PathBuf::from(dir);
+        if let Some(parent) = p.parent() {
+            return parent.to_path_buf();
+        }
+    }
     runtime_dir().join("ssh-agent-mux")
 }
 
@@ -143,6 +155,24 @@ fn discover_and_build(
     let mut state = mux::build_mux_state_validated(&sockets, timeout)?;
     state.primary_agent = primary_agent.map(PathBuf::from);
     Ok(state)
+}
+
+/// Do a synchronous refresh: discover, build, swap state, return new key count.
+fn do_refresh(
+    state: &ArcSwap<mux::MuxState>,
+    timeout: Duration,
+    exclude: &Path,
+    primary_agent: Option<&Path>,
+) -> anyhow::Result<usize> {
+    let new_state = discover_and_build(timeout, exclude, primary_agent)?;
+    let count = new_state.key_map.len();
+    let old = state.load();
+    let old_count = old.key_map.len();
+    state.store(Arc::new(new_state));
+    if count != old_count {
+        info!("Refreshed: {old_count} -> {count} keys");
+    }
+    Ok(count)
 }
 
 // --- Socket creation ---
@@ -289,17 +319,8 @@ fn refresh_loop(
             last_proc_poll = Instant::now();
         }
 
-        match discover_and_build(timeout, &own_socket, primary_agent.as_deref()) {
-            Ok(new_state) => {
-                let old = state.load();
-                let old_count = old.key_map.len();
-                let new_count = new_state.key_map.len();
-                state.store(Arc::new(new_state));
-                if new_count != old_count {
-                    info!("Refreshed: {old_count} -> {new_count} keys");
-                }
-            }
-            Err(e) => warn!("Refresh failed: {e}"),
+        if let Err(e) = do_refresh(&state, timeout, &own_socket, primary_agent.as_deref()) {
+            warn!("Refresh failed: {e}");
         }
     }
 }
@@ -315,24 +336,69 @@ fn cleanup(sock_path: &Path, ctl_path: &Path, pid_path: &Path) {
     let _ = fs::remove_file(pid_path);
 }
 
-// --- Control socket client (for status/refresh subcommands) ---
+// --- Control socket client ---
 
-fn ctl_command(args: &CtlArgs, command: &str) -> anyhow::Result<()> {
-    let dir = args.socket_dir.clone().unwrap_or_else(default_socket_dir);
+fn ctl_socket_dir(args: &CtlArgs) -> PathBuf {
+    args.socket_dir.clone().unwrap_or_else(default_socket_dir)
+}
+
+fn ctl_command(args: &CtlArgs, command: &str) -> anyhow::Result<String> {
+    let dir = ctl_socket_dir(args);
     let ctl_path = dir.join("control.sock");
 
-    let mut stream = UnixStream::connect(&ctl_path)
-        .with_context(|| format!("connecting to {}", ctl_path.display()))?;
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let mut stream = UnixStream::connect(&ctl_path).with_context(|| {
+        format!("connecting to {} (is the daemon running?)", ctl_path.display())
+    })?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
 
     writeln!(stream, "{command}")?;
     stream.flush()?;
 
     let mut response = String::new();
     BufReader::new(&stream).read_line(&mut response)?;
-    print!("{response}");
+    Ok(response)
+}
 
+fn cmd_status(args: &CtlArgs) -> anyhow::Result<()> {
+    let response = ctl_command(args, "STATUS")?;
+    if args.json {
+        print!("{response}");
+    } else {
+        print!("{}", control::format_status_human(&response));
+    }
     Ok(())
+}
+
+fn cmd_refresh(args: &CtlArgs) -> anyhow::Result<()> {
+    let response = ctl_command(args, "REFRESH")?;
+    print!("{response}");
+    Ok(())
+}
+
+fn cmd_stop(_args: &CtlArgs) -> anyhow::Result<()> {
+    let pid_path = default_pid_path();
+    let contents =
+        fs::read_to_string(&pid_path).with_context(|| format!("reading {}", pid_path.display()))?;
+    let pid: i32 = contents.trim().parse().context("parsing PID")?;
+
+    // Verify it's actually ssh-agent-mux
+    let cmdline = fs::read(format!("/proc/{pid}/cmdline")).context("process not found")?;
+    if !String::from_utf8_lossy(&cmdline).contains("ssh-agent-mux") {
+        bail!("PID {pid} is not ssh-agent-mux");
+    }
+
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+
+    // Wait for exit (5s timeout)
+    for _ in 0..50 {
+        if fs::metadata(format!("/proc/{pid}")).is_err() {
+            println!("Stopped (pid {pid})");
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    bail!("Daemon (pid {pid}) did not exit within 5 seconds");
 }
 
 // --- Main ---
@@ -341,8 +407,9 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Status(args) => ctl_command(&args, "STATUS"),
-        Command::Refresh(args) => ctl_command(&args, "REFRESH"),
+        Command::Status(args) => cmd_status(&args),
+        Command::Refresh(args) => cmd_refresh(&args),
+        Command::Stop(args) => cmd_stop(&args),
         Command::Start(args) => run_daemon(args),
     }
 }
@@ -351,7 +418,6 @@ fn run_daemon(cli: StartArgs) -> anyhow::Result<()> {
     let timeout = Duration::from_secs(cli.timeout);
     let auto_discover = cli.agents.is_empty();
 
-    // Determine paths
     let sock_dir = cli
         .socket
         .as_ref()
@@ -362,10 +428,8 @@ fn run_daemon(cli: StartArgs) -> anyhow::Result<()> {
     let pid_path = cli.pid_file.unwrap_or_else(default_pid_path);
     let log_path = cli.log_file.unwrap_or_else(default_log_path);
 
-    // Fail fast: check for existing instance
     check_pid_file(&pid_path)?;
 
-    // Discover and build initial state
     let primary_agent = cli.primary_agent.as_deref();
     let state = if auto_discover {
         discover_and_build(timeout, &sock_path, primary_agent)?
@@ -385,36 +449,29 @@ fn run_daemon(cli: StartArgs) -> anyhow::Result<()> {
         state.key_map.values().collect::<std::collections::HashSet<_>>().len()
     );
 
-    // Bind listeners
     let agent_listener = create_socket(&sock_path)?;
     let ctl_listener = create_socket(&ctl_path)?;
 
-    // Print export line (visible before daemonizing)
     println!("SSH_AUTH_SOCK={}; export SSH_AUTH_SOCK;", sock_path.display());
 
-    // Daemonize or stay in foreground
     if !cli.foreground {
         daemonize()?;
     }
 
-    // Init logging
     init_logging(cli.foreground, &log_path);
     info!("Listening on {}", sock_path.display());
 
-    // Write PID file
     write_pid_file(&pid_path)?;
 
-    // Signal handling
     let shutdown = Arc::new(AtomicBool::new(false));
     let reload = Arc::new(AtomicBool::new(false));
+    let locked = Arc::new(AtomicBool::new(false));
 
     signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&shutdown))?;
     signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&shutdown))?;
     signal_hook::flag::register(signal_hook::consts::SIGHUP, Arc::clone(&reload))?;
 
-    // Shared state
     let state = Arc::new(ArcSwap::from_pointee(state));
-    let lock_state = Arc::new(Mutex::new(None));
     let start_time = Instant::now();
 
     // Spawn refresh thread
@@ -430,7 +487,16 @@ fn run_daemon(cli: StartArgs) -> anyhow::Result<()> {
         });
     }
 
-    // Accept loop -- poll both agent and control listener fds
+    // Build sync refresh closure for control socket
+    let own_socket_for_ctl = sock_path.clone();
+    let primary_for_ctl = cli.primary_agent.clone();
+    let state_for_ctl = Arc::clone(&state);
+    let sync_refresh = move || {
+        let _ =
+            do_refresh(&state_for_ctl, timeout, &own_socket_for_ctl, primary_for_ctl.as_deref());
+    };
+
+    // Accept loop
     use std::os::unix::io::AsRawFd;
     let agent_fd = agent_listener.as_raw_fd();
     let ctl_fd = ctl_listener.as_raw_fd();
@@ -450,30 +516,33 @@ fn run_daemon(cli: StartArgs) -> anyhow::Result<()> {
             continue;
         }
 
-        // Handle agent connections
         if pfds[0].revents & libc::POLLIN != 0
             && let Ok((stream, _)) = agent_listener.accept()
         {
             if let Err(reason) = security::check_peer_uid(&stream) {
                 warn!("Rejected connection: {reason}");
             } else {
-                let snapshot = state.load_full();
+                let state = Arc::clone(&state);
                 let reload = Arc::clone(&reload);
-                let lock = Arc::clone(&lock_state);
-                thread::spawn(move || {
-                    mux::handle_client(stream, &snapshot, Some(&reload), Some(&lock))
-                });
+                let locked = Arc::clone(&locked);
+                thread::spawn(move || mux::handle_client(stream, &state, &reload, &locked));
             }
         }
 
-        // Handle control connections (inline, no thread needed)
         if pfds[1].revents & libc::POLLIN != 0
             && let Ok((stream, _)) = ctl_listener.accept()
         {
             if let Err(reason) = security::check_peer_uid(&stream) {
                 warn!("Rejected control connection: {reason}");
             } else {
-                control::handle_control_client(stream, &state, &reload, &lock_state, start_time);
+                control::handle_control_client(
+                    stream,
+                    &state,
+                    &reload,
+                    &locked,
+                    start_time,
+                    Some(&sync_refresh),
+                );
             }
         }
     }

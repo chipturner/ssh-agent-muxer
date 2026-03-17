@@ -1,4 +1,4 @@
-use inotify::{Inotify, WatchMask};
+use inotify::{EventMask, Inotify, WatchMask};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::{fs, io};
@@ -70,6 +70,12 @@ impl AgentWatcher {
 
         if let Ok(events) = self.inotify.read_events(&mut self.buf) {
             for event in events {
+                // Queue overflow -- force a full rescan
+                if event.mask.contains(EventMask::Q_OVERFLOW) {
+                    log::warn!("inotify queue overflow, forcing full rescan");
+                    return true;
+                }
+
                 let Some(name) = event.name else { continue };
                 let name_str = name.to_string_lossy();
 
