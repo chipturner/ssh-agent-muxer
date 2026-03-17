@@ -4,9 +4,38 @@ use std::path::Path;
 use std::time::Duration;
 
 pub const SSH_AGENT_FAILURE: u8 = 5;
+pub const SSH_AGENT_SUCCESS: u8 = 6;
 pub const SSH_AGENTC_REQUEST_IDENTITIES: u8 = 11;
 pub const SSH2_AGENT_IDENTITIES_ANSWER: u8 = 12;
 pub const SSH_AGENTC_SIGN_REQUEST: u8 = 13;
+
+/// Write operations -- forwarded to primary agent if configured.
+pub const SSH_AGENTC_ADD_IDENTITY: u8 = 17;
+pub const SSH_AGENTC_REMOVE_IDENTITY: u8 = 18;
+pub const SSH_AGENTC_REMOVE_ALL_IDENTITIES: u8 = 19;
+pub const SSH_AGENTC_ADD_SMARTCARD_KEY: u8 = 20;
+pub const SSH_AGENTC_REMOVE_SMARTCARD_KEY: u8 = 21;
+pub const SSH_AGENTC_LOCK: u8 = 22;
+pub const SSH_AGENTC_UNLOCK: u8 = 23;
+pub const SSH_AGENTC_ADD_ID_CONSTRAINED: u8 = 25;
+pub const SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED: u8 = 26;
+pub const SSH_AGENTC_EXTENSION: u8 = 27;
+
+pub fn is_write_operation(msg_type: u8) -> bool {
+    matches!(
+        msg_type,
+        SSH_AGENTC_ADD_IDENTITY
+            | SSH_AGENTC_REMOVE_IDENTITY
+            | SSH_AGENTC_REMOVE_ALL_IDENTITIES
+            | SSH_AGENTC_ADD_SMARTCARD_KEY
+            | SSH_AGENTC_REMOVE_SMARTCARD_KEY
+            | SSH_AGENTC_LOCK
+            | SSH_AGENTC_UNLOCK
+            | SSH_AGENTC_ADD_ID_CONSTRAINED
+            | SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED
+            | SSH_AGENTC_EXTENSION
+    )
+}
 
 const MAX_MESSAGE_LEN: usize = 10 * 1024 * 1024; // 10 MiB
 

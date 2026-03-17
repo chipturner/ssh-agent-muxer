@@ -6,6 +6,7 @@ use ssh_agent_fixer::proto;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 const TIMEOUT: Duration = Duration::from_secs(2);
@@ -21,7 +22,7 @@ fn start_mux_listener(state: Arc<mux::MuxState>) -> (PathBuf, tempfile::TempDir)
             match conn {
                 Ok(stream) => {
                     let state = Arc::clone(&state);
-                    std::thread::spawn(move || mux::handle_client(stream, &state));
+                    std::thread::spawn(move || mux::handle_client(stream, &state, None));
                 }
                 Err(_) => break,
             }
@@ -212,7 +213,7 @@ fn start_mux_listener_swappable(
             match conn {
                 Ok(stream) => {
                     let snapshot = state.load_full();
-                    std::thread::spawn(move || mux::handle_client(stream, &snapshot));
+                    std::thread::spawn(move || mux::handle_client(stream, &snapshot, None));
                 }
                 Err(_) => break,
             }
@@ -287,4 +288,92 @@ fn test_mux_old_client_unaffected_by_refresh() {
     // New connection sees 2 keys
     let (nkeys, _) = request_identities(&sock_path);
     assert_eq!(nkeys, 2);
+}
+
+// --- Empty state tests ---
+
+#[test]
+fn test_mux_empty_state_returns_zero_keys() {
+    let state = mux::build_mux_state_from_sockets(&[], TIMEOUT).unwrap();
+    assert_eq!(state.key_map.len(), 0);
+
+    let state = Arc::new(state);
+    let (sock_path, _dir) = start_mux_listener(state);
+    let (nkeys, _) = request_identities(&sock_path);
+    assert_eq!(nkeys, 0);
+}
+
+// --- Write operation forwarding tests ---
+
+#[test]
+fn test_mux_write_without_primary_rejects() {
+    let agent = common::TestAgent::start();
+    agent.add_key("write-test");
+
+    let sockets = vec![agent.sock_path().to_path_buf()];
+    let state = mux::build_mux_state_from_sockets(&sockets, TIMEOUT).unwrap();
+
+    let state = Arc::new(state);
+    let (sock_path, _dir) = start_mux_listener(state);
+
+    // Try to add a key (type 17) -- should get FAILURE since no primary agent
+    let mut stream = UnixStream::connect(&sock_path).unwrap();
+    stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+    proto::write_message(&mut stream, &[proto::SSH_AGENTC_ADD_IDENTITY, 0]).unwrap();
+    let resp = proto::read_message(&mut stream).unwrap();
+    assert_eq!(resp, vec![proto::SSH_AGENT_FAILURE]);
+}
+
+#[test]
+fn test_mux_write_with_primary_forwards() {
+    let agent = common::TestAgent::start();
+    agent.add_key("primary-test");
+
+    let sockets = vec![agent.sock_path().to_path_buf()];
+    let mut state = mux::build_mux_state_from_sockets(&sockets, TIMEOUT).unwrap();
+    state.primary_agent = Some(agent.sock_path().to_path_buf());
+
+    let reload = Arc::new(AtomicBool::new(false));
+
+    let dir = tempfile::tempdir().unwrap();
+    let sock_path = dir.path().join("mux.sock");
+    let listener = UnixListener::bind(&sock_path).unwrap();
+
+    let reload_clone = Arc::clone(&reload);
+    std::thread::spawn(move || {
+        let state = Arc::new(state);
+        for conn in listener.incoming() {
+            match conn {
+                Ok(stream) => {
+                    let state = Arc::clone(&state);
+                    let reload = Arc::clone(&reload_clone);
+                    std::thread::spawn(move || mux::handle_client(stream, &state, Some(&reload)));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // Lock the agent (type 22) -- should be forwarded to primary agent
+    // Lock requires a passphrase (string), so send one
+    let mut msg = vec![proto::SSH_AGENTC_LOCK];
+    proto::put_string(&mut msg, b"test-passphrase");
+
+    let mut stream = UnixStream::connect(&sock_path).unwrap();
+    stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+    proto::write_message(&mut stream, &msg).unwrap();
+    let resp = proto::read_message(&mut stream).unwrap();
+
+    // ssh-agent should accept the lock and return SUCCESS
+    assert_eq!(resp, vec![proto::SSH_AGENT_SUCCESS]);
+
+    // Write operation should have triggered a reload
+    assert!(reload.load(Ordering::Relaxed), "reload flag should be set after write");
+
+    // Unlock so the agent is usable for cleanup
+    let mut msg = vec![proto::SSH_AGENTC_UNLOCK];
+    proto::put_string(&mut msg, b"test-passphrase");
+    proto::write_message(&mut stream, &msg).unwrap();
+    let resp = proto::read_message(&mut stream).unwrap();
+    assert_eq!(resp, vec![proto::SSH_AGENT_SUCCESS]);
 }

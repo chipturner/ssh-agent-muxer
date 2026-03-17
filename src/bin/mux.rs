@@ -2,7 +2,7 @@ use anyhow::{Context, bail};
 use arc_swap::ArcSwap;
 use clap::Parser;
 use log::{error, info, warn};
-use ssh_agent_fixer::{discover, mux, proto, security};
+use ssh_agent_fixer::{discover, mux, proto, security, watch};
 use std::io::Write;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
@@ -30,8 +30,9 @@ struct Cli {
     #[arg(short, long)]
     foreground: bool,
 
-    /// Auto-discovery refresh interval in seconds (0 to disable)
-    #[arg(long, default_value = "30")]
+    /// /proc poll interval in seconds for agent discovery fallback (0 to disable)
+    /// inotify handles fast detection; this is the slow safety net
+    #[arg(long, default_value = "300")]
     refresh_interval: u64,
 
     /// PID file path
@@ -41,6 +42,10 @@ struct Cli {
     /// Log file path (default: $XDG_RUNTIME_DIR/ssh-agent-mux/mux.log in daemon mode)
     #[arg(long)]
     log_file: Option<PathBuf>,
+
+    /// Primary agent for write operations (ssh-add, lock, etc.)
+    #[arg(long, value_name = "PATH")]
+    primary_agent: Option<PathBuf>,
 }
 
 // --- Path helpers ---
@@ -75,12 +80,15 @@ fn current_uid() -> u32 {
 
 // --- Discovery ---
 
-fn discover_live_sockets(timeout: Duration) -> anyhow::Result<Vec<PathBuf>> {
+fn discover_live_sockets(timeout: Duration, exclude: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let discovery = discover::discover()?;
     let mut sockets: Vec<PathBuf> = discovery
         .sockets
         .into_keys()
         .filter(|path| {
+            if path == exclude {
+                return false;
+            }
             let mut stream = match proto::agent_connect(path, timeout) {
                 Ok(s) => s,
                 Err(_) => return false,
@@ -99,9 +107,15 @@ fn discover_live_sockets(timeout: Duration) -> anyhow::Result<Vec<PathBuf>> {
     Ok(sockets)
 }
 
-fn discover_and_build(timeout: Duration) -> anyhow::Result<mux::MuxState> {
-    let sockets = discover_live_sockets(timeout)?;
-    mux::build_mux_state_validated(&sockets, timeout)
+fn discover_and_build(
+    timeout: Duration,
+    exclude: &Path,
+    primary_agent: Option<&Path>,
+) -> anyhow::Result<mux::MuxState> {
+    let sockets = discover_live_sockets(timeout, exclude)?;
+    let mut state = mux::build_mux_state_validated(&sockets, timeout)?;
+    state.primary_agent = primary_agent.map(PathBuf::from);
+    Ok(state)
 }
 
 // --- Socket creation ---
@@ -219,27 +233,50 @@ fn init_logging(foreground: bool, log_file: &Path) {
 
 fn refresh_loop(
     state: Arc<ArcSwap<mux::MuxState>>,
-    interval: Duration,
+    proc_interval: Duration,
     timeout: Duration,
     shutdown: Arc<AtomicBool>,
     reload: Arc<AtomicBool>,
+    own_socket: PathBuf,
+    primary_agent: Option<PathBuf>,
 ) {
+    // Set up inotify watcher for fast detection
+    let runtime = runtime_dir();
+    let extra_dirs: Vec<&Path> = vec![runtime.as_path()];
+    let mut watcher = watch::AgentWatcher::new(&extra_dirs).ok();
+    if watcher.is_none() {
+        warn!("inotify unavailable, falling back to polling only");
+    }
+
+    let mut last_proc_poll = Instant::now();
+
     loop {
-        let deadline = Instant::now() + interval;
-        while Instant::now() < deadline {
-            if shutdown.load(Ordering::Relaxed) {
-                return;
-            }
-            if reload.swap(false, Ordering::Relaxed) {
-                break;
-            }
-            thread::sleep(Duration::from_millis(500));
-        }
         if shutdown.load(Ordering::Relaxed) {
             return;
         }
 
-        match discover_and_build(timeout) {
+        // Check for explicit reload request (SIGHUP or write operation)
+        let force_reload = reload.swap(false, Ordering::Relaxed);
+
+        // Check inotify for new sockets (1-second poll timeout)
+        let inotify_triggered = watcher.as_mut().is_some_and(|w| w.poll(1000));
+
+        // Periodic /proc fallback
+        let proc_due = last_proc_poll.elapsed() >= proc_interval;
+
+        if !force_reload && !inotify_triggered && !proc_due {
+            if watcher.is_none() {
+                // No inotify -- sleep briefly before next iteration
+                thread::sleep(Duration::from_secs(1));
+            }
+            continue;
+        }
+
+        if proc_due {
+            last_proc_poll = Instant::now();
+        }
+
+        match discover_and_build(timeout, &own_socket, primary_agent.as_deref()) {
             Ok(new_state) => {
                 let old = state.load();
                 let old_count = old.key_map.len();
@@ -280,11 +317,17 @@ fn main() -> anyhow::Result<()> {
     // Fail fast: check for existing instance
     check_pid_file(&pid_path)?;
 
-    // Fail fast: discover and build initial state
-    let sockets = if auto_discover { discover_live_sockets(timeout)? } else { cli.agents.clone() };
-    let state = mux::build_mux_state_validated(&sockets, timeout)?;
+    // Discover and build initial state
+    let primary_agent = cli.primary_agent.as_deref();
+    let state = if auto_discover {
+        discover_and_build(timeout, &sock_path, primary_agent)?
+    } else {
+        let mut s = mux::build_mux_state_validated(&cli.agents, timeout)?;
+        s.primary_agent = primary_agent.map(PathBuf::from);
+        s
+    };
 
-    if state.key_map.is_empty() {
+    if state.key_map.is_empty() && !auto_discover {
         bail!("No live agents found");
     }
 
@@ -329,7 +372,11 @@ fn main() -> anyhow::Result<()> {
         let shutdown = Arc::clone(&shutdown);
         let reload = Arc::clone(&reload);
         let interval = Duration::from_secs(cli.refresh_interval);
-        thread::spawn(move || refresh_loop(state, interval, timeout, shutdown, reload));
+        let own_socket = sock_path.clone();
+        let primary = cli.primary_agent.clone();
+        thread::spawn(move || {
+            refresh_loop(state, interval, timeout, shutdown, reload, own_socket, primary)
+        });
     }
 
     // Accept loop with poll-based timeout so shutdown flag is checked promptly.
@@ -359,7 +406,8 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 }
                 let snapshot = state.load_full();
-                thread::spawn(move || mux::handle_client(stream, &snapshot));
+                let reload = Arc::clone(&reload);
+                thread::spawn(move || mux::handle_client(stream, &snapshot, Some(&reload)));
             }
             Err(e) => error!("Accept error: {e}"),
         }

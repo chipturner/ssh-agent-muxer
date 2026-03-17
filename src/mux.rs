@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 pub struct MuxState {
@@ -11,6 +12,9 @@ pub struct MuxState {
     /// key_blob -> backend socket path
     pub key_map: HashMap<Vec<u8>, PathBuf>,
     pub timeout: Duration,
+    /// Agent to forward write operations to (add/remove key, lock/unlock).
+    /// If None, write operations return FAILURE.
+    pub primary_agent: Option<PathBuf>,
 }
 
 /// Build mux state, skipping backend sockets that fail security validation.
@@ -85,10 +89,12 @@ pub fn build_mux_state_from_sockets(
         proto::put_string(&mut resp, comment);
     }
 
-    Ok(MuxState { identities_response: resp, key_map, timeout })
+    Ok(MuxState { identities_response: resp, key_map, timeout, primary_agent: None })
 }
 
-pub fn handle_client(mut stream: UnixStream, state: &MuxState) {
+/// Handle a single client connection.
+/// `reload` is an optional flag set after write operations to trigger state refresh.
+pub fn handle_client(mut stream: UnixStream, state: &MuxState, reload: Option<&AtomicBool>) {
     loop {
         let msg = match proto::read_message(&mut stream) {
             Ok(m) => m,
@@ -100,25 +106,44 @@ pub fn handle_client(mut stream: UnixStream, state: &MuxState) {
             continue;
         }
 
-        match msg[0] {
-            proto::SSH_AGENTC_REQUEST_IDENTITIES => {
-                if proto::write_message(&mut stream, &state.identities_response).is_err() {
-                    return;
-                }
-            }
-            proto::SSH_AGENTC_SIGN_REQUEST => {
-                let response = handle_sign_request(&msg, state);
-                if proto::write_message(&mut stream, &response).is_err() {
-                    return;
-                }
-            }
-            _ => {
-                if proto::write_message(&mut stream, &[proto::SSH_AGENT_FAILURE]).is_err() {
-                    return;
-                }
-            }
+        let response = match msg[0] {
+            proto::SSH_AGENTC_REQUEST_IDENTITIES => state.identities_response.clone(),
+            proto::SSH_AGENTC_SIGN_REQUEST => handle_sign_request(&msg, state),
+            t if proto::is_write_operation(t) => handle_write_operation(&msg, state, reload),
+            _ => vec![proto::SSH_AGENT_FAILURE],
+        };
+
+        if proto::write_message(&mut stream, &response).is_err() {
+            return;
         }
     }
+}
+
+fn handle_write_operation(msg: &[u8], state: &MuxState, reload: Option<&AtomicBool>) -> Vec<u8> {
+    let Some(primary) = &state.primary_agent else {
+        return vec![proto::SSH_AGENT_FAILURE];
+    };
+
+    let mut backend = match proto::agent_connect(primary, state.timeout) {
+        Ok(s) => s,
+        Err(_) => return vec![proto::SSH_AGENT_FAILURE],
+    };
+
+    if proto::write_message(&mut backend, msg).is_err() {
+        return vec![proto::SSH_AGENT_FAILURE];
+    }
+
+    let response = match proto::read_message(&mut backend) {
+        Ok(r) => r,
+        Err(_) => return vec![proto::SSH_AGENT_FAILURE],
+    };
+
+    // Trigger refresh so new keys are visible
+    if let Some(reload) = reload {
+        reload.store(true, Ordering::Relaxed);
+    }
+
+    response
 }
 
 fn handle_sign_request(msg: &[u8], state: &MuxState) -> Vec<u8> {

@@ -34,19 +34,21 @@ just mux                  # start mux daemon, prints SSH_AUTH_SOCK export line
 just mux --foreground     # mux in foreground (logs to stderr)
 just mux -s /tmp/my.sock  # mux with explicit listener socket path
 just mux --agent /path/to/sock  # manual mode (no auto-discovery)
+just mux --primary-agent /path/to/sock  # enable write ops (ssh-add) via this agent
 ```
 
 ## Architecture
 
-Lib crate with two thin binaries. Five modules:
+Lib crate with two thin binaries. Seven modules:
 
 - **`proto`** -- SSH agent wire format. Length-prefixed messages (`[u32 BE length][body]`), `read_u32`/`read_string`/`put_u32`/`put_string` cursor-based parsing, `read_message`/`write_message` for framed I/O. `connect_timeout` using non-blocking socket + poll. No external SSH crate -- the protocol is implemented inline.
 - **`discover`** -- Walk `/proc/*/environ`, extract `SSH_AUTH_SOCK` and `SSH_AGENT_PID`. Returns `Discovery { sockets: HashMap<PathBuf, HashSet<u32>>, agent_pids: HashMap<u32, HashSet<u32>> }`.
 - **`probe`** -- `probe_agent()` connects to a socket, sends `REQUEST_IDENTITIES`, parses the response into `Vec<Identity>` with SHA-256 fingerprints. `AgentStatus` enum: `Alive(Vec<Identity>)`, `Dead(String)`, `PermissionDenied`.
 - **`mux`** -- Core multiplexer logic. `MuxState` holds a pre-serialized `IDENTITIES_ANSWER` and a `key_map: HashMap<Vec<u8>, PathBuf>` (key blob -> backend socket). `handle_client()` dispatches: `REQUEST_IDENTITIES` returns cached response, `SIGN_REQUEST` routes by key blob lookup, others return `FAILURE`. `build_mux_state_validated()` adds security filtering.
 - **`security`** -- Socket security. `validate_backend_socket()` checks ownership/permissions. `get_peer_cred()`/`check_peer_uid()` verify connecting clients via `SO_PEERCRED`.
+- **`watch`** -- `AgentWatcher` uses inotify to monitor `/tmp` and runtime dirs for new `ssh-*` directories and `agent.*` socket files. Sub-second detection of new SSH agents.
 - **`bin/probe.rs`** -- CLI for `ssh-agent-probe`. Pretty-prints agents, keys (grouped by fingerprint with tree connectors), stale PIDs.
-- **`bin/mux.rs`** -- Daemon for `ssh-agent-mux`. Daemonizes (double-fork), periodic auto-discovery via `ArcSwap<MuxState>`, signal handling (SIGTERM/SIGINT shutdown, SIGHUP refresh), PID file, stable socket at `$XDG_RUNTIME_DIR/ssh-agent-mux/agent.sock`.
+- **`bin/mux.rs`** -- Daemon for `ssh-agent-mux`. Daemonizes (double-fork), inotify-based agent detection with /proc poll fallback via `ArcSwap<MuxState>`, signal handling (SIGTERM/SIGINT shutdown, SIGHUP refresh), PID file, stable socket at `$XDG_RUNTIME_DIR/ssh-agent-mux/agent.sock`. Excludes own socket from discovery to prevent loops. `--primary-agent` enables write operation forwarding.
 
 ### SSH Agent Wire Protocol
 
@@ -70,7 +72,10 @@ The mux routes sign requests by matching the `key_blob` field against `key_map`.
 - **Connect timeout**: `UnixStream::connect` has no timeout, so `connect_timeout` uses `SOCK_NONBLOCK` + `poll()` + `SO_ERROR` check.
 - **Thread-per-client**: Mux uses `thread::spawn` per accepted connection. State shared via `ArcSwap<MuxState>` -- each client gets an immutable `Arc<MuxState>` snapshot, so refreshes never block active connections.
 - **Poll-based accept loop**: `libc::poll()` with 1-second timeout on the listener fd, since `signal-hook` uses `SA_RESTART` (accept() wouldn't return EINTR). Shutdown flag checked between polls.
+- **inotify + /proc hybrid detection**: `AgentWatcher` uses inotify on `/tmp` and runtime dirs for sub-second detection of new agents. Slow /proc poll (5 min default) as safety net. inotify watches for `ssh-*` directories and `agent.*` socket files.
 - **Socket security**: Listener socket chmod 0600, directory chmod 0700. Backend sockets validated for ownership and permissions. Client connections checked via `SO_PEERCRED`.
+- **Write operation forwarding**: `--primary-agent` designates one agent for write operations (ssh-add, lock/unlock). Without it, writes return FAILURE. Successful writes trigger state refresh via reload flag.
+- **Self-exclusion**: Discovery filters out the mux's own listener socket to prevent routing loops.
 - **Process cleanup in tests**: `TestAgent` and `TestDaemon` structs wrap `Child` + `TempDir`. `Drop` kills processes and cleans up files. Even panicking tests clean up.
 
 ## Development Notes
