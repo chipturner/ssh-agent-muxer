@@ -22,18 +22,15 @@ pub const SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED: u8 = 26;
 pub const SSH_AGENTC_EXTENSION: u8 = 27;
 pub const SSH_AGENT_EXTENSION_FAILURE: u8 = 28;
 
-pub fn is_write_operation(msg_type: u8) -> bool {
+/// Operations that require a primary agent (add key, smartcard ops).
+pub fn is_add_operation(msg_type: u8) -> bool {
     matches!(
         msg_type,
         SSH_AGENTC_ADD_IDENTITY
-            | SSH_AGENTC_REMOVE_IDENTITY
-            | SSH_AGENTC_REMOVE_ALL_IDENTITIES
-            | SSH_AGENTC_ADD_SMARTCARD_KEY
-            | SSH_AGENTC_REMOVE_SMARTCARD_KEY
-            | SSH_AGENTC_LOCK
-            | SSH_AGENTC_UNLOCK
             | SSH_AGENTC_ADD_ID_CONSTRAINED
+            | SSH_AGENTC_ADD_SMARTCARD_KEY
             | SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED
+            | SSH_AGENTC_REMOVE_SMARTCARD_KEY
     )
 }
 

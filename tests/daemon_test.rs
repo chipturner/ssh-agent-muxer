@@ -1,6 +1,6 @@
 mod common;
 
-use ssh_agent_fixer::proto;
+use ssh_agent_mux::proto;
 use std::os::unix::net::UnixStream;
 use std::process::{Child, Command};
 use std::time::Duration;
@@ -24,6 +24,7 @@ impl TestDaemon {
         let binary = env!("CARGO_BIN_EXE_ssh-agent-mux");
         let child = Command::new(binary)
             .args([
+                "start",
                 "--foreground",
                 "--socket",
                 sock_path.to_str().unwrap(),
@@ -137,6 +138,7 @@ fn test_pid_file_prevents_duplicate() {
     let sock2 = daemon._dir.path().join("mux2.sock");
     let output = Command::new(binary)
         .args([
+            "start",
             "--foreground",
             "--socket",
             sock2.to_str().unwrap(),
@@ -168,6 +170,7 @@ fn test_multiple_agents_manual_mode() {
     let binary = env!("CARGO_BIN_EXE_ssh-agent-mux");
     let mut child = Command::new(binary)
         .args([
+            "start",
             "--foreground",
             "--socket",
             sock_path.to_str().unwrap(),

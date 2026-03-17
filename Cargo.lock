@@ -590,7 +590,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "ssh-agent-fixer"
+name = "ssh-agent-mux"
 version = "0.1.0"
 dependencies = [
  "anyhow",

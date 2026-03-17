@@ -1,5 +1,5 @@
 use clap::Parser;
-use ssh_agent_fixer::{discover, probe};
+use ssh_agent_mux::{discover, probe};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;

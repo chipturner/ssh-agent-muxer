@@ -1,6 +1,6 @@
 mod common;
 
-use ssh_agent_fixer::probe::{self, AgentStatus};
+use ssh_agent_mux::probe::{self, AgentStatus};
 use std::time::Duration;
 
 const TIMEOUT: Duration = Duration::from_secs(2);

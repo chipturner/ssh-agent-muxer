@@ -1,3 +1,4 @@
+pub mod control;
 pub mod discover;
 pub mod mux;
 pub mod probe;

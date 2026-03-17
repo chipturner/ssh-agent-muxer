@@ -1,11 +1,11 @@
 [package]
-name = "ssh-agent-fixer"
+name = "ssh-agent-mux"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
 
 [lib]
-name = "ssh_agent_fixer"
+name = "ssh_agent_mux"
 
 [[bin]]
 name = "ssh-agent-probe"

@@ -1,19 +1,35 @@
 use anyhow::{Context, bail};
 use arc_swap::ArcSwap;
-use clap::Parser;
-use log::{error, info, warn};
-use ssh_agent_fixer::{discover, mux, proto, security, watch};
-use std::io::Write;
-use std::os::unix::net::UnixListener;
+use clap::{Args, Parser, Subcommand};
+use log::{info, warn};
+use ssh_agent_mux::{control, discover, mux, proto, security, watch};
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::{fs, io, thread};
 
 #[derive(Parser)]
 #[command(name = "ssh-agent-mux", about = "Multiplex SSH agents into one")]
 struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Start the mux daemon
+    Start(StartArgs),
+    /// Show daemon status (backends, keys, lock state)
+    Status(CtlArgs),
+    /// Trigger immediate agent rediscovery
+    Refresh(CtlArgs),
+}
+
+#[derive(Args)]
+struct StartArgs {
     /// Socket timeout in seconds
     #[arg(short, long, default_value = "2")]
     timeout: u64,
@@ -31,7 +47,6 @@ struct Cli {
     foreground: bool,
 
     /// /proc poll interval in seconds for agent discovery fallback (0 to disable)
-    /// inotify handles fast detection; this is the slow safety net
     #[arg(long, default_value = "300")]
     refresh_interval: u64,
 
@@ -43,9 +58,16 @@ struct Cli {
     #[arg(long)]
     log_file: Option<PathBuf>,
 
-    /// Primary agent for write operations (ssh-add, lock, etc.)
+    /// Primary agent for add operations (ssh-add)
     #[arg(long, value_name = "PATH")]
     primary_agent: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct CtlArgs {
+    /// Socket directory (to find control.sock)
+    #[arg(short, long)]
+    socket_dir: Option<PathBuf>,
 }
 
 // --- Path helpers ---
@@ -62,8 +84,8 @@ fn runtime_dir() -> PathBuf {
     PathBuf::from(format!("/tmp/ssh-agent-mux-{uid}"))
 }
 
-fn default_socket_path() -> PathBuf {
-    runtime_dir().join("ssh-agent-mux").join("agent.sock")
+fn default_socket_dir() -> PathBuf {
+    runtime_dir().join("ssh-agent-mux")
 }
 
 fn default_pid_path() -> PathBuf {
@@ -71,7 +93,7 @@ fn default_pid_path() -> PathBuf {
 }
 
 fn default_log_path() -> PathBuf {
-    runtime_dir().join("ssh-agent-mux").join("mux.log")
+    default_socket_dir().join("mux.log")
 }
 
 fn current_uid() -> u32 {
@@ -83,7 +105,6 @@ fn current_uid() -> u32 {
 fn discover_live_sockets(timeout: Duration, exclude: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let discovery = discover::discover()?;
 
-    // Union /proc scan with filesystem scan, deduplicate
     let mut candidates: std::collections::BTreeSet<PathBuf> =
         discovery.sockets.into_keys().collect();
     for path in discover::scan_socket_dirs() {
@@ -132,7 +153,6 @@ fn create_socket(path: &Path) -> anyhow::Result<UnixListener> {
         chmod(parent, 0o700);
     }
 
-    // Remove stale socket
     if path.exists() {
         fs::remove_file(path)?;
     }
@@ -164,7 +184,6 @@ fn check_pid_file(path: &Path) -> anyhow::Result<()> {
         bail!("Already running as PID {pid}");
     }
 
-    // Stale PID file
     fs::remove_file(path)?;
     Ok(())
 }
@@ -180,26 +199,22 @@ fn write_pid_file(path: &Path) -> anyhow::Result<()> {
 // --- Daemonization ---
 
 fn daemonize() -> anyhow::Result<()> {
-    // First fork
     match unsafe { libc::fork() } {
         -1 => bail!("fork failed: {}", io::Error::last_os_error()),
-        0 => {}                     // child continues
-        _ => std::process::exit(0), // parent exits
+        0 => {}
+        _ => std::process::exit(0),
     }
 
-    // New session
     if unsafe { libc::setsid() } < 0 {
         bail!("setsid failed: {}", io::Error::last_os_error());
     }
 
-    // Second fork (prevent terminal acquisition)
     match unsafe { libc::fork() } {
         -1 => bail!("second fork failed: {}", io::Error::last_os_error()),
-        0 => {}                     // grandchild continues
-        _ => std::process::exit(0), // child exits
+        0 => {}
+        _ => std::process::exit(0),
     }
 
-    // Redirect stdin/stdout/stderr to /dev/null
     let devnull = fs::OpenOptions::new().read(true).write(true).open("/dev/null")?;
     use std::os::unix::io::AsRawFd;
     let fd = devnull.as_raw_fd();
@@ -220,7 +235,6 @@ fn init_logging(foreground: bool, log_file: &Path) {
     if foreground {
         env_logger::Builder::new().parse_filters(&filter).init();
     } else {
-        // File-based logger for daemon mode
         let file = match fs::OpenOptions::new().create(true).append(true).open(log_file) {
             Ok(f) => f,
             Err(e) => {
@@ -246,7 +260,6 @@ fn refresh_loop(
     own_socket: PathBuf,
     primary_agent: Option<PathBuf>,
 ) {
-    // Set up inotify watcher for fast detection
     let runtime = runtime_dir();
     let extra_dirs: Vec<&Path> = vec![runtime.as_path()];
     let mut watcher = watch::AgentWatcher::new(&extra_dirs).ok();
@@ -261,18 +274,12 @@ fn refresh_loop(
             return;
         }
 
-        // Check for explicit reload request (SIGHUP or write operation)
         let force_reload = reload.swap(false, Ordering::Relaxed);
-
-        // Check inotify for new sockets (1-second poll timeout)
         let inotify_triggered = watcher.as_mut().is_some_and(|w| w.poll(1000));
-
-        // Periodic /proc fallback
         let proc_due = last_proc_poll.elapsed() >= proc_interval;
 
         if !force_reload && !inotify_triggered && !proc_due {
             if watcher.is_none() {
-                // No inotify -- sleep briefly before next iteration
                 thread::sleep(Duration::from_secs(1));
             }
             continue;
@@ -299,24 +306,59 @@ fn refresh_loop(
 
 // --- Cleanup ---
 
-fn cleanup(sock_path: &Path, pid_path: &Path) {
+fn cleanup(sock_path: &Path, ctl_path: &Path, pid_path: &Path) {
     let _ = fs::remove_file(sock_path);
-    // Remove parent dir if it's our managed directory
+    let _ = fs::remove_file(ctl_path);
     if let Some(parent) = sock_path.parent() {
         let _ = fs::remove_dir(parent);
     }
     let _ = fs::remove_file(pid_path);
 }
 
+// --- Control socket client (for status/refresh subcommands) ---
+
+fn ctl_command(args: &CtlArgs, command: &str) -> anyhow::Result<()> {
+    let dir = args.socket_dir.clone().unwrap_or_else(default_socket_dir);
+    let ctl_path = dir.join("control.sock");
+
+    let mut stream = UnixStream::connect(&ctl_path)
+        .with_context(|| format!("connecting to {}", ctl_path.display()))?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+
+    writeln!(stream, "{command}")?;
+    stream.flush()?;
+
+    let mut response = String::new();
+    BufReader::new(&stream).read_line(&mut response)?;
+    print!("{response}");
+
+    Ok(())
+}
+
 // --- Main ---
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    match cli.command {
+        Command::Status(args) => ctl_command(&args, "STATUS"),
+        Command::Refresh(args) => ctl_command(&args, "REFRESH"),
+        Command::Start(args) => run_daemon(args),
+    }
+}
+
+fn run_daemon(cli: StartArgs) -> anyhow::Result<()> {
     let timeout = Duration::from_secs(cli.timeout);
     let auto_discover = cli.agents.is_empty();
 
     // Determine paths
-    let sock_path = cli.socket.unwrap_or_else(default_socket_path);
+    let sock_dir = cli
+        .socket
+        .as_ref()
+        .and_then(|p| p.parent().map(PathBuf::from))
+        .unwrap_or_else(default_socket_dir);
+    let sock_path = cli.socket.unwrap_or_else(|| sock_dir.join("agent.sock"));
+    let ctl_path = sock_dir.join("control.sock");
     let pid_path = cli.pid_file.unwrap_or_else(default_pid_path);
     let log_path = cli.log_file.unwrap_or_else(default_log_path);
 
@@ -343,8 +385,9 @@ fn main() -> anyhow::Result<()> {
         state.key_map.values().collect::<std::collections::HashSet<_>>().len()
     );
 
-    // Fail fast: bind listener
-    let listener = create_socket(&sock_path)?;
+    // Bind listeners
+    let agent_listener = create_socket(&sock_path)?;
+    let ctl_listener = create_socket(&ctl_path)?;
 
     // Print export line (visible before daemonizing)
     println!("SSH_AUTH_SOCK={}; export SSH_AUTH_SOCK;", sock_path.display());
@@ -354,7 +397,7 @@ fn main() -> anyhow::Result<()> {
         daemonize()?;
     }
 
-    // Init logging (after fork so daemon logs to file, foreground logs to stderr)
+    // Init logging
     init_logging(cli.foreground, &log_path);
     info!("Listening on {}", sock_path.display());
 
@@ -369,10 +412,12 @@ fn main() -> anyhow::Result<()> {
     signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&shutdown))?;
     signal_hook::flag::register(signal_hook::consts::SIGHUP, Arc::clone(&reload))?;
 
-    // Shared state via ArcSwap
+    // Shared state
     let state = Arc::new(ArcSwap::from_pointee(state));
+    let lock_state = Arc::new(Mutex::new(None));
+    let start_time = Instant::now();
 
-    // Spawn refresh thread (auto-discover mode only)
+    // Spawn refresh thread
     if auto_discover && cli.refresh_interval > 0 {
         let state = Arc::clone(&state);
         let shutdown = Arc::clone(&shutdown);
@@ -385,41 +430,55 @@ fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Accept loop with poll-based timeout so shutdown flag is checked promptly.
-    // signal-hook registers handlers with SA_RESTART, so accept() won't return
-    // EINTR. Instead we use poll() with a 1-second timeout.
+    // Accept loop -- poll both agent and control listener fds
     use std::os::unix::io::AsRawFd;
-    let listener_fd = listener.as_raw_fd();
+    let agent_fd = agent_listener.as_raw_fd();
+    let ctl_fd = ctl_listener.as_raw_fd();
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
 
-        // Poll the listener fd with 1-second timeout
-        let mut pfd = libc::pollfd { fd: listener_fd, events: libc::POLLIN, revents: 0 };
-        let ret = unsafe { libc::poll(&raw mut pfd, 1, 1000) };
+        let mut pfds = [
+            libc::pollfd { fd: agent_fd, events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: ctl_fd, events: libc::POLLIN, revents: 0 },
+        ];
+        let ret = unsafe { libc::poll(pfds.as_mut_ptr(), 2, 1000) };
 
         if ret <= 0 {
-            // Timeout or error -- just loop and check shutdown
             continue;
         }
 
-        match listener.accept() {
-            Ok((stream, _)) => {
-                if let Err(reason) = security::check_peer_uid(&stream) {
-                    warn!("Rejected connection: {reason}");
-                    continue;
-                }
+        // Handle agent connections
+        if pfds[0].revents & libc::POLLIN != 0
+            && let Ok((stream, _)) = agent_listener.accept()
+        {
+            if let Err(reason) = security::check_peer_uid(&stream) {
+                warn!("Rejected connection: {reason}");
+            } else {
                 let snapshot = state.load_full();
                 let reload = Arc::clone(&reload);
-                thread::spawn(move || mux::handle_client(stream, &snapshot, Some(&reload)));
+                let lock = Arc::clone(&lock_state);
+                thread::spawn(move || {
+                    mux::handle_client(stream, &snapshot, Some(&reload), Some(&lock))
+                });
             }
-            Err(e) => error!("Accept error: {e}"),
+        }
+
+        // Handle control connections (inline, no thread needed)
+        if pfds[1].revents & libc::POLLIN != 0
+            && let Ok((stream, _)) = ctl_listener.accept()
+        {
+            if let Err(reason) = security::check_peer_uid(&stream) {
+                warn!("Rejected control connection: {reason}");
+            } else {
+                control::handle_control_client(stream, &state, &reload, &lock_state, start_time);
+            }
         }
     }
 
-    cleanup(&sock_path, &pid_path);
+    cleanup(&sock_path, &ctl_path, &pid_path);
     info!("Shutting down");
 
     Ok(())
