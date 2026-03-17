@@ -2,7 +2,7 @@ use crate::proto;
 use std::collections::HashMap;
 use std::io::Write;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -108,7 +108,8 @@ pub fn handle_client(mut stream: UnixStream, state: &MuxState, reload: Option<&A
 
         let response = match msg[0] {
             proto::SSH_AGENTC_REQUEST_IDENTITIES => state.identities_response.clone(),
-            proto::SSH_AGENTC_SIGN_REQUEST => handle_sign_request(&msg, state),
+            proto::SSH_AGENTC_SIGN_REQUEST => handle_sign_request(&msg, state, reload),
+            proto::SSH_AGENTC_EXTENSION => handle_extension(&msg, state, reload),
             t if proto::is_write_operation(t) => handle_write_operation(&msg, state, reload),
             _ => vec![proto::SSH_AGENT_FAILURE],
         };
@@ -124,29 +125,15 @@ fn handle_write_operation(msg: &[u8], state: &MuxState, reload: Option<&AtomicBo
         return vec![proto::SSH_AGENT_FAILURE];
     };
 
-    let mut backend = match proto::agent_connect(primary, state.timeout) {
-        Ok(s) => s,
-        Err(_) => return vec![proto::SSH_AGENT_FAILURE],
-    };
+    let response = forward_to_backend(primary, msg, state.timeout, None);
 
-    if proto::write_message(&mut backend, msg).is_err() {
-        return vec![proto::SSH_AGENT_FAILURE];
-    }
-
-    let response = match proto::read_message(&mut backend) {
-        Ok(r) => r,
-        Err(_) => return vec![proto::SSH_AGENT_FAILURE],
-    };
-
-    // Trigger refresh so new keys are visible
-    if let Some(reload) = reload {
-        reload.store(true, Ordering::Relaxed);
-    }
+    // Always trigger refresh after write so new/removed keys are visible
+    set_reload(reload);
 
     response
 }
 
-fn handle_sign_request(msg: &[u8], state: &MuxState) -> Vec<u8> {
+fn handle_sign_request(msg: &[u8], state: &MuxState, reload: Option<&AtomicBool>) -> Vec<u8> {
     let mut pos = 1; // skip type byte
     let Some(key_blob) = proto::read_string(msg, &mut pos) else {
         return vec![proto::SSH_AGENT_FAILURE];
@@ -156,17 +143,65 @@ fn handle_sign_request(msg: &[u8], state: &MuxState) -> Vec<u8> {
         return vec![proto::SSH_AGENT_FAILURE];
     };
 
-    let mut backend = match proto::agent_connect(backend_path, state.timeout) {
+    forward_to_backend(backend_path, msg, state.timeout, reload)
+}
+
+/// Forward a message to a specific backend agent and return the response.
+/// Sets the reload flag on backend I/O failure so dead backends are pruned.
+fn forward_to_backend(
+    backend_path: &Path,
+    msg: &[u8],
+    timeout: Duration,
+    reload: Option<&AtomicBool>,
+) -> Vec<u8> {
+    let mut backend = match proto::agent_connect(backend_path, timeout) {
         Ok(s) => s,
-        Err(_) => return vec![proto::SSH_AGENT_FAILURE],
+        Err(_) => {
+            set_reload(reload);
+            return vec![proto::SSH_AGENT_FAILURE];
+        }
     };
 
     if proto::write_message(&mut backend, msg).is_err() {
+        set_reload(reload);
         return vec![proto::SSH_AGENT_FAILURE];
     }
 
     match proto::read_message(&mut backend) {
         Ok(response) => response,
-        Err(_) => vec![proto::SSH_AGENT_FAILURE],
+        Err(_) => {
+            set_reload(reload);
+            vec![proto::SSH_AGENT_FAILURE]
+        }
     }
+}
+
+fn set_reload(reload: Option<&AtomicBool>) {
+    if let Some(flag) = reload {
+        flag.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Handle SSH_AGENTC_EXTENSION (type 27).
+/// Routes session-bind@openssh.com by key blob to the correct backend.
+/// Returns EXTENSION_FAILURE (28) for unknown extensions.
+fn handle_extension(msg: &[u8], state: &MuxState, reload: Option<&AtomicBool>) -> Vec<u8> {
+    let mut pos = 1; // skip type byte
+    let Some(ext_name) = proto::read_string(msg, &mut pos) else {
+        return vec![proto::SSH_AGENT_EXTENSION_FAILURE];
+    };
+
+    if ext_name == b"session-bind@openssh.com" {
+        // Second field is the key blob -- route like a sign request
+        let Some(key_blob) = proto::read_string(msg, &mut pos) else {
+            return vec![proto::SSH_AGENT_EXTENSION_FAILURE];
+        };
+        let Some(backend_path) = state.key_map.get(key_blob) else {
+            return vec![proto::SSH_AGENT_EXTENSION_FAILURE];
+        };
+        return forward_to_backend(backend_path, msg, state.timeout, reload);
+    }
+
+    // Unknown extension
+    vec![proto::SSH_AGENT_EXTENSION_FAILURE]
 }

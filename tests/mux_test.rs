@@ -377,3 +377,130 @@ fn test_mux_write_with_primary_forwards() {
     let resp = proto::read_message(&mut stream).unwrap();
     assert_eq!(resp, vec![proto::SSH_AGENT_SUCCESS]);
 }
+
+// --- Sign-failure reload tests ---
+
+/// Helper: start a mux listener with reload flag tracking.
+fn start_mux_listener_with_reload(
+    state: mux::MuxState,
+) -> (PathBuf, tempfile::TempDir, Arc<AtomicBool>) {
+    let reload = Arc::new(AtomicBool::new(false));
+    let dir = tempfile::tempdir().unwrap();
+    let sock_path = dir.path().join("mux.sock");
+    let listener = UnixListener::bind(&sock_path).unwrap();
+
+    let reload_clone = Arc::clone(&reload);
+    std::thread::spawn(move || {
+        let state = Arc::new(state);
+        for conn in listener.incoming() {
+            match conn {
+                Ok(stream) => {
+                    let state = Arc::clone(&state);
+                    let reload = Arc::clone(&reload_clone);
+                    std::thread::spawn(move || mux::handle_client(stream, &state, Some(&reload)));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    (sock_path, dir, reload)
+}
+
+#[test]
+fn test_mux_sign_failure_triggers_reload() {
+    let agent_a = common::TestAgent::start();
+    let agent_b = common::TestAgent::start();
+    agent_a.add_key("sign-reload-a");
+    agent_b.add_key("sign-reload-b");
+
+    let sockets = vec![agent_a.sock_path().to_path_buf(), agent_b.sock_path().to_path_buf()];
+    let state = mux::build_mux_state_from_sockets(&sockets, TIMEOUT).unwrap();
+    assert_eq!(state.key_map.len(), 2);
+
+    // Grab agent_b's key blob before killing it
+    let (_, key_blobs) = {
+        let state_arc = Arc::new(mux::build_mux_state_from_sockets(&sockets, TIMEOUT).unwrap());
+        let (sock, _dir) = start_mux_listener(state_arc);
+        request_identities(&sock)
+    };
+
+    let (sock_path, _dir, reload) = start_mux_listener_with_reload(state);
+
+    // Kill agent_b so its backend is dead
+    drop(agent_b);
+
+    // Try to sign with agent_b's key -- should fail AND trigger reload
+    let msg = build_sign_request(&key_blobs[1], b"test data");
+    let mut stream = UnixStream::connect(&sock_path).unwrap();
+    stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+    proto::write_message(&mut stream, &msg).unwrap();
+    let resp = proto::read_message(&mut stream).unwrap();
+
+    assert_eq!(resp, vec![proto::SSH_AGENT_FAILURE]);
+    assert!(reload.load(Ordering::Relaxed), "reload should be set on sign failure");
+}
+
+// --- Extension routing tests ---
+
+#[test]
+fn test_extension_unknown_returns_extension_failure() {
+    let agent = common::TestAgent::start();
+    agent.add_key("ext-test");
+
+    let sockets = vec![agent.sock_path().to_path_buf()];
+    let state = mux::build_mux_state_from_sockets(&sockets, TIMEOUT).unwrap();
+
+    let state = Arc::new(state);
+    let (sock_path, _dir) = start_mux_listener(state);
+
+    // Send unknown extension
+    let mut msg = vec![proto::SSH_AGENTC_EXTENSION];
+    proto::put_string(&mut msg, b"unknown-extension@example.com");
+
+    let mut stream = UnixStream::connect(&sock_path).unwrap();
+    stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+    proto::write_message(&mut stream, &msg).unwrap();
+    let resp = proto::read_message(&mut stream).unwrap();
+
+    // Should return EXTENSION_FAILURE (28), not generic FAILURE (5)
+    assert_eq!(resp, vec![proto::SSH_AGENT_EXTENSION_FAILURE]);
+}
+
+#[test]
+fn test_extension_session_bind_routes_by_key() {
+    let agent = common::TestAgent::start();
+    agent.add_key("session-bind-test");
+
+    let sockets = vec![agent.sock_path().to_path_buf()];
+    let state = mux::build_mux_state_from_sockets(&sockets, TIMEOUT).unwrap();
+
+    let state = Arc::new(state);
+    let (sock_path, _dir) = start_mux_listener(Arc::clone(&state));
+
+    // Get the key blob
+    let (_, key_blobs) = request_identities(&sock_path);
+    assert_eq!(key_blobs.len(), 1);
+
+    // Build a session-bind extension message
+    let mut msg = vec![proto::SSH_AGENTC_EXTENSION];
+    proto::put_string(&mut msg, b"session-bind@openssh.com");
+    proto::put_string(&mut msg, &key_blobs[0]); // key blob
+    proto::put_string(&mut msg, b"fake-session-id"); // session identifier
+    proto::put_string(&mut msg, b"fake-signature"); // signature
+    msg.push(0); // is_forwarding = false
+
+    let mut stream = UnixStream::connect(&sock_path).unwrap();
+    stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+    proto::write_message(&mut stream, &msg).unwrap();
+    let resp = proto::read_message(&mut stream).unwrap();
+
+    // The real agent will likely reject the fake signature, but it should
+    // NOT return EXTENSION_FAILURE (28) -- that means we didn't route it.
+    // It should return either SUCCESS (6) or generic FAILURE (5) from the agent.
+    assert_ne!(
+        resp,
+        vec![proto::SSH_AGENT_EXTENSION_FAILURE],
+        "should route to backend, not return extension failure"
+    );
+}

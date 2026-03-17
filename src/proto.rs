@@ -20,6 +20,7 @@ pub const SSH_AGENTC_UNLOCK: u8 = 23;
 pub const SSH_AGENTC_ADD_ID_CONSTRAINED: u8 = 25;
 pub const SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED: u8 = 26;
 pub const SSH_AGENTC_EXTENSION: u8 = 27;
+pub const SSH_AGENT_EXTENSION_FAILURE: u8 = 28;
 
 pub fn is_write_operation(msg_type: u8) -> bool {
     matches!(
@@ -33,7 +34,6 @@ pub fn is_write_operation(msg_type: u8) -> bool {
             | SSH_AGENTC_UNLOCK
             | SSH_AGENTC_ADD_ID_CONSTRAINED
             | SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED
-            | SSH_AGENTC_EXTENSION
     )
 }
 
@@ -180,8 +180,9 @@ fn make_sockaddr_un(path: &Path) -> io::Result<libc::sockaddr_un> {
 
     let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
-    addr.sun_path[..bytes.len()]
-        .copy_from_slice(unsafe { &*(bytes as *const [u8] as *const [i8]) });
+    for (i, &byte) in bytes.iter().enumerate() {
+        addr.sun_path[i] = byte as libc::c_char;
+    }
     Ok(addr)
 }
 

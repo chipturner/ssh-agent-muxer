@@ -82,9 +82,16 @@ fn current_uid() -> u32 {
 
 fn discover_live_sockets(timeout: Duration, exclude: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let discovery = discover::discover()?;
-    let mut sockets: Vec<PathBuf> = discovery
-        .sockets
-        .into_keys()
+
+    // Union /proc scan with filesystem scan, deduplicate
+    let mut candidates: std::collections::BTreeSet<PathBuf> =
+        discovery.sockets.into_keys().collect();
+    for path in discover::scan_socket_dirs() {
+        candidates.insert(path);
+    }
+
+    let sockets: Vec<PathBuf> = candidates
+        .into_iter()
         .filter(|path| {
             if path == exclude {
                 return false;
@@ -103,7 +110,6 @@ fn discover_live_sockets(timeout: Duration, exclude: &Path) -> anyhow::Result<Ve
             )
         })
         .collect();
-    sockets.sort();
     Ok(sockets)
 }
 
