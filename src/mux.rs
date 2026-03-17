@@ -12,7 +12,10 @@ pub struct MuxState {
     pub identities_response: Vec<u8>,
     /// key_blob -> backend socket path
     pub key_map: HashMap<Vec<u8>, PathBuf>,
-    pub timeout: Duration,
+    /// Timeout for discovery probes and fast operations
+    pub discover_timeout: Duration,
+    /// Timeout for sign requests and lock/unlock (longer for hardware tokens)
+    pub sign_timeout: Duration,
     /// Agent to forward add operations to. If None, adds return FAILURE.
     pub primary_agent: Option<PathBuf>,
 }
@@ -20,7 +23,8 @@ pub struct MuxState {
 /// Build mux state, skipping backend sockets that fail security validation.
 pub fn build_mux_state_validated(
     sockets: &[PathBuf],
-    timeout: Duration,
+    discover_timeout: Duration,
+    sign_timeout: Duration,
 ) -> anyhow::Result<MuxState> {
     let valid: Vec<PathBuf> = sockets
         .iter()
@@ -33,19 +37,20 @@ pub fn build_mux_state_validated(
         })
         .cloned()
         .collect();
-    build_mux_state_from_sockets(&valid, timeout)
+    build_mux_state_from_sockets(&valid, discover_timeout, sign_timeout)
 }
 
 /// Build mux state from an explicit list of agent socket paths.
 pub fn build_mux_state_from_sockets(
     sockets: &[PathBuf],
-    timeout: Duration,
+    discover_timeout: Duration,
+    sign_timeout: Duration,
 ) -> anyhow::Result<MuxState> {
     let mut key_map: HashMap<Vec<u8>, PathBuf> = HashMap::new();
     let mut merged_keys: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
 
     for path in sockets {
-        let mut stream = match proto::agent_connect(path, timeout) {
+        let mut stream = match proto::agent_connect(path, discover_timeout) {
             Ok(s) => s,
             Err(_) => continue,
         };
@@ -89,7 +94,13 @@ pub fn build_mux_state_from_sockets(
         proto::put_string(&mut resp, comment);
     }
 
-    Ok(MuxState { identities_response: resp, key_map, timeout, primary_agent: None })
+    Ok(MuxState {
+        identities_response: resp,
+        key_map,
+        discover_timeout,
+        sign_timeout,
+        primary_agent: None,
+    })
 }
 
 fn empty_identities() -> Vec<u8> {
@@ -120,15 +131,12 @@ pub fn handle_client(
             continue;
         }
 
-        // Fresh state snapshot per message
         let snap = state.load();
         let is_locked = locked.load(Ordering::Relaxed);
 
         let response = match msg[0] {
-            // Unlock is always allowed
             proto::SSH_AGENTC_UNLOCK => handle_unlock(&msg, &snap, locked, reload),
 
-            // When locked, gate everything except unlock
             _ if is_locked => match msg[0] {
                 proto::SSH_AGENTC_REQUEST_IDENTITIES => empty_identities(),
                 proto::SSH_AGENTC_LOCK => vec![proto::SSH_AGENT_FAILURE],
@@ -136,7 +144,6 @@ pub fn handle_client(
                 _ => vec![proto::SSH_AGENT_FAILURE],
             },
 
-            // Normal (unlocked) dispatch
             proto::SSH_AGENTC_REQUEST_IDENTITIES => snap.identities_response.clone(),
             proto::SSH_AGENTC_SIGN_REQUEST => handle_sign_request(&msg, &snap, reload),
             proto::SSH_AGENTC_EXTENSION => handle_extension(&msg, &snap, reload),
@@ -153,18 +160,31 @@ pub fn handle_client(
     }
 }
 
-// --- Lock/Unlock (broadcast to all backends) ---
+// --- Lock/Unlock (broadcast with rollback) ---
 
 fn handle_lock(msg: &[u8], state: &MuxState, locked: &AtomicBool, reload: &AtomicBool) -> Vec<u8> {
     if locked.load(Ordering::Relaxed) {
-        return vec![proto::SSH_AGENT_FAILURE]; // already locked
+        return vec![proto::SSH_AGENT_FAILURE];
     }
 
-    // Broadcast LOCK to all backends -- succeed only if all succeed
-    let backends: HashSet<&PathBuf> = state.key_map.values().collect();
+    let backends: Vec<&PathBuf> =
+        state.key_map.values().collect::<HashSet<_>>().into_iter().collect();
+    let mut locked_backends = Vec::new();
+
     for backend in &backends {
-        let resp = forward_to_backend(backend, msg, state.timeout, reload);
-        if resp.first() != Some(&proto::SSH_AGENT_SUCCESS) {
+        let resp = forward_to_backend(backend, msg, state.sign_timeout, reload);
+        if resp.first() == Some(&proto::SSH_AGENT_SUCCESS) {
+            locked_backends.push(*backend);
+        } else {
+            // Rollback: unlock backends we already locked
+            let mut pos = 1;
+            if let Some(passphrase) = proto::read_string(msg, &mut pos) {
+                let mut unlock_msg = vec![proto::SSH_AGENTC_UNLOCK];
+                proto::put_string(&mut unlock_msg, passphrase);
+                for b in &locked_backends {
+                    let _ = forward_to_backend(b, &unlock_msg, state.sign_timeout, reload);
+                }
+            }
             return vec![proto::SSH_AGENT_FAILURE];
         }
     }
@@ -180,21 +200,30 @@ fn handle_unlock(
     reload: &AtomicBool,
 ) -> Vec<u8> {
     if !locked.load(Ordering::Relaxed) {
-        return vec![proto::SSH_AGENT_FAILURE]; // not locked
+        return vec![proto::SSH_AGENT_FAILURE];
     }
 
-    // Broadcast UNLOCK to all backends -- succeed only if all succeed
+    // Best-effort broadcast: unlock as many backends as possible
     let backends: HashSet<&PathBuf> = state.key_map.values().collect();
+    let mut any_success = false;
+
     for backend in &backends {
-        let resp = forward_to_backend(backend, msg, state.timeout, reload);
-        if resp.first() != Some(&proto::SSH_AGENT_SUCCESS) {
-            return vec![proto::SSH_AGENT_FAILURE];
+        let resp = forward_to_backend(backend, msg, state.sign_timeout, reload);
+        if resp.first() == Some(&proto::SSH_AGENT_SUCCESS) {
+            any_success = true;
+        } else {
+            log::warn!("Unlock failed for backend {}", backend.display());
         }
     }
 
-    locked.store(false, Ordering::Relaxed);
-    set_reload(reload); // refresh to pick up unlocked keys
-    vec![proto::SSH_AGENT_SUCCESS]
+    // Unlock mux if any backend succeeded (or no backends exist)
+    if any_success || backends.is_empty() {
+        locked.store(false, Ordering::Relaxed);
+        set_reload(reload);
+        vec![proto::SSH_AGENT_SUCCESS]
+    } else {
+        vec![proto::SSH_AGENT_FAILURE]
+    }
 }
 
 // --- Write operations ---
@@ -203,7 +232,7 @@ fn handle_add(msg: &[u8], state: &MuxState, reload: &AtomicBool) -> Vec<u8> {
     let Some(primary) = &state.primary_agent else {
         return vec![proto::SSH_AGENT_FAILURE];
     };
-    let response = forward_to_backend(primary, msg, state.timeout, reload);
+    let response = forward_to_backend(primary, msg, state.discover_timeout, reload);
     set_reload(reload);
     response
 }
@@ -216,7 +245,7 @@ fn handle_remove_identity(msg: &[u8], state: &MuxState, reload: &AtomicBool) -> 
     let Some(backend_path) = state.key_map.get(key_blob) else {
         return vec![proto::SSH_AGENT_FAILURE];
     };
-    let response = forward_to_backend(backend_path, msg, state.timeout, reload);
+    let response = forward_to_backend(backend_path, msg, state.discover_timeout, reload);
     set_reload(reload);
     response
 }
@@ -226,7 +255,7 @@ fn handle_remove_all(msg: &[u8], state: &MuxState, reload: &AtomicBool) -> Vec<u
     let mut any_success = false;
 
     for backend in backends {
-        let resp = forward_to_backend(backend, msg, state.timeout, reload);
+        let resp = forward_to_backend(backend, msg, state.discover_timeout, reload);
         if resp.first() == Some(&proto::SSH_AGENT_SUCCESS) {
             any_success = true;
         }
@@ -251,7 +280,7 @@ fn handle_sign_request(msg: &[u8], state: &MuxState, reload: &AtomicBool) -> Vec
     let Some(backend_path) = state.key_map.get(key_blob) else {
         return vec![proto::SSH_AGENT_FAILURE];
     };
-    forward_to_backend(backend_path, msg, state.timeout, reload)
+    forward_to_backend(backend_path, msg, state.sign_timeout, reload)
 }
 
 fn handle_extension(msg: &[u8], state: &MuxState, reload: &AtomicBool) -> Vec<u8> {
@@ -267,7 +296,7 @@ fn handle_extension(msg: &[u8], state: &MuxState, reload: &AtomicBool) -> Vec<u8
         let Some(backend_path) = state.key_map.get(key_blob) else {
             return vec![proto::SSH_AGENT_EXTENSION_FAILURE];
         };
-        return forward_to_backend(backend_path, msg, state.timeout, reload);
+        return forward_to_backend(backend_path, msg, state.sign_timeout, reload);
     }
 
     vec![proto::SSH_AGENT_EXTENSION_FAILURE]
@@ -281,7 +310,6 @@ fn forward_to_backend(
     timeout: Duration,
     reload: &AtomicBool,
 ) -> Vec<u8> {
-    // Re-validate socket security before connecting (TOCTOU mitigation)
     if let Err(reason) = crate::security::validate_backend_socket(backend_path) {
         log::warn!("Backend rejected on connect: {}: {reason}", backend_path.display());
         set_reload(reload);

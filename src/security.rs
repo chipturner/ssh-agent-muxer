@@ -16,8 +16,8 @@ pub fn validate_backend_socket(path: &Path) -> Result<(), String> {
     }
 
     let mode = meta.mode();
-    if mode & 0o002 != 0 {
-        return Err("world-writable".into());
+    if mode & 0o022 != 0 {
+        return Err("group/world-writable".into());
     }
     if mode & 0o004 != 0 {
         return Err("world-readable".into());
@@ -139,7 +139,18 @@ mod tests {
         chmod_socket(&sock_path, 0o777);
 
         let err = validate_backend_socket(&sock_path).unwrap_err();
-        assert!(err.contains("world-writable"), "got: {err}");
+        assert!(err.contains("writable"), "got: {err}");
+    }
+
+    #[test]
+    fn test_validate_rejects_group_writable() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("test.sock");
+        let _listener = UnixListener::bind(&sock_path).unwrap();
+        chmod_socket(&sock_path, 0o660);
+
+        let err = validate_backend_socket(&sock_path).unwrap_err();
+        assert!(err.contains("writable"), "got: {err}");
     }
 
     #[test]

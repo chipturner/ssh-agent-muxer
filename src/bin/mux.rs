@@ -6,8 +6,8 @@ use ssh_agent_mux::{control, discover, mux, proto, security, watch};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::{fs, io, thread};
 
@@ -32,9 +32,13 @@ enum Command {
 
 #[derive(Args)]
 struct StartArgs {
-    /// Socket timeout in seconds
+    /// Discovery/probe timeout in seconds
     #[arg(short, long, default_value = "2")]
     timeout: u64,
+
+    /// Sign request timeout in seconds (longer for hardware tokens)
+    #[arg(long, default_value = "30")]
+    sign_timeout: u64,
 
     /// Listener socket path
     #[arg(short, long)]
@@ -147,24 +151,41 @@ fn discover_live_sockets(timeout: Duration, exclude: &Path) -> anyhow::Result<Ve
 }
 
 fn discover_and_build(
-    timeout: Duration,
+    discover_timeout: Duration,
+    sign_timeout: Duration,
     exclude: &Path,
     primary_agent: Option<&Path>,
 ) -> anyhow::Result<mux::MuxState> {
-    let sockets = discover_live_sockets(timeout, exclude)?;
-    let mut state = mux::build_mux_state_validated(&sockets, timeout)?;
+    let sockets = discover_live_sockets(discover_timeout, exclude)?;
+    let mut state = mux::build_mux_state_validated(&sockets, discover_timeout, sign_timeout)?;
     state.primary_agent = primary_agent.map(PathBuf::from);
     Ok(state)
 }
 
-/// Do a synchronous refresh: discover, build, swap state, return new key count.
 fn do_refresh(
     state: &ArcSwap<mux::MuxState>,
-    timeout: Duration,
+    discover_timeout: Duration,
+    sign_timeout: Duration,
     exclude: &Path,
     primary_agent: Option<&Path>,
+    refresh_mutex: &Mutex<()>,
+    blocking: bool,
 ) -> anyhow::Result<usize> {
-    let new_state = discover_and_build(timeout, exclude, primary_agent)?;
+    let guard = if blocking {
+        Some(refresh_mutex.lock().unwrap_or_else(|e| e.into_inner()))
+    } else {
+        match refresh_mutex.try_lock() {
+            Ok(g) => Some(g),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                log::debug!("Refresh already in progress, skipping");
+                let snap = state.load();
+                return Ok(snap.key_map.len());
+            }
+            Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner()),
+        }
+    };
+
+    let new_state = discover_and_build(discover_timeout, sign_timeout, exclude, primary_agent)?;
     let count = new_state.key_map.len();
     let old = state.load();
     let old_count = old.key_map.len();
@@ -172,6 +193,7 @@ fn do_refresh(
     if count != old_count {
         info!("Refreshed: {old_count} -> {count} keys");
     }
+    drop(guard);
     Ok(count)
 }
 
@@ -198,32 +220,43 @@ fn chmod(path: &Path, mode: u32) {
     }
 }
 
-// --- PID file ---
+// --- PID file (atomic via flock) ---
 
-fn check_pid_file(path: &Path) -> anyhow::Result<()> {
-    let contents = match fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e).context("reading pid file"),
-    };
-
-    if let Ok(pid) = contents.trim().parse::<u32>()
-        && let Ok(cmd) = fs::read(format!("/proc/{pid}/cmdline"))
-        && String::from_utf8_lossy(&cmd).contains("ssh-agent-mux")
-    {
-        bail!("Already running as PID {pid}");
-    }
-
-    fs::remove_file(path)?;
-    Ok(())
+struct PidFile {
+    _file: fs::File,
+    path: PathBuf,
 }
 
-fn write_pid_file(path: &Path) -> anyhow::Result<()> {
+impl Drop for PidFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn acquire_pid_file(path: &Path) -> anyhow::Result<PidFile> {
+    use std::os::unix::io::AsRawFd;
+
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(path, format!("{}\n", std::process::id()))?;
-    Ok(())
+
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .with_context(|| format!("opening {}", path.display()))?;
+
+    let fd = file.as_raw_fd();
+    if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let contents = fs::read_to_string(path).unwrap_or_default();
+        bail!("Already running (PID {}). Use `ssh-agent-mux stop` to terminate.", contents.trim());
+    }
+
+    // We hold the lock -- write our PID
+    file.set_len(0)?;
+    writeln!(&file, "{}", std::process::id())?;
+    Ok(PidFile { _file: file, path: path.to_path_buf() })
 }
 
 // --- Daemonization ---
@@ -260,12 +293,14 @@ fn daemonize() -> anyhow::Result<()> {
 // --- Logging ---
 
 fn init_logging(foreground: bool, log_file: &Path) {
+    use std::os::unix::fs::OpenOptionsExt;
     let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into());
 
     if foreground {
         env_logger::Builder::new().parse_filters(&filter).init();
     } else {
-        let file = match fs::OpenOptions::new().create(true).append(true).open(log_file) {
+        let file = match fs::OpenOptions::new().create(true).append(true).mode(0o600).open(log_file)
+        {
             Ok(f) => f,
             Err(e) => {
                 eprintln!("Failed to open log file {}: {e}", log_file.display());
@@ -281,14 +316,17 @@ fn init_logging(foreground: bool, log_file: &Path) {
 
 // --- Refresh loop ---
 
+#[allow(clippy::too_many_arguments)]
 fn refresh_loop(
     state: Arc<ArcSwap<mux::MuxState>>,
     proc_interval: Duration,
-    timeout: Duration,
+    discover_timeout: Duration,
+    sign_timeout: Duration,
     shutdown: Arc<AtomicBool>,
     reload: Arc<AtomicBool>,
     own_socket: PathBuf,
     primary_agent: Option<PathBuf>,
+    refresh_mutex: Arc<Mutex<()>>,
 ) {
     let runtime = runtime_dir();
     let extra_dirs: Vec<&Path> = vec![runtime.as_path()];
@@ -319,7 +357,15 @@ fn refresh_loop(
             last_proc_poll = Instant::now();
         }
 
-        if let Err(e) = do_refresh(&state, timeout, &own_socket, primary_agent.as_deref()) {
+        if let Err(e) = do_refresh(
+            &state,
+            discover_timeout,
+            sign_timeout,
+            &own_socket,
+            primary_agent.as_deref(),
+            &refresh_mutex,
+            false, // non-blocking in refresh loop
+        ) {
             warn!("Refresh failed: {e}");
         }
     }
@@ -327,13 +373,12 @@ fn refresh_loop(
 
 // --- Cleanup ---
 
-fn cleanup(sock_path: &Path, ctl_path: &Path, pid_path: &Path) {
+fn cleanup(sock_path: &Path, ctl_path: &Path) {
     let _ = fs::remove_file(sock_path);
     let _ = fs::remove_file(ctl_path);
     if let Some(parent) = sock_path.parent() {
         let _ = fs::remove_dir(parent);
     }
-    let _ = fs::remove_file(pid_path);
 }
 
 // --- Control socket client ---
@@ -347,7 +392,10 @@ fn ctl_command(args: &CtlArgs, command: &str) -> anyhow::Result<String> {
     let ctl_path = dir.join("control.sock");
 
     let mut stream = UnixStream::connect(&ctl_path).with_context(|| {
-        format!("connecting to {} (is the daemon running?)", ctl_path.display())
+        format!(
+            "Cannot connect to daemon at {}. Is it running? Start with `ssh-agent-mux start`.",
+            ctl_path.display()
+        )
     })?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
 
@@ -375,13 +423,19 @@ fn cmd_refresh(args: &CtlArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_stop(_args: &CtlArgs) -> anyhow::Result<()> {
+fn cmd_stop(args: &CtlArgs) -> anyhow::Result<()> {
+    // Try control socket first
+    if let Ok(response) = ctl_command(args, "STOP") {
+        print!("{response}");
+        return Ok(());
+    }
+
+    // Fall back to PID file + SIGTERM
     let pid_path = default_pid_path();
-    let contents =
-        fs::read_to_string(&pid_path).with_context(|| format!("reading {}", pid_path.display()))?;
+    let contents = fs::read_to_string(&pid_path)
+        .with_context(|| format!("reading {}. Is the daemon running?", pid_path.display()))?;
     let pid: i32 = contents.trim().parse().context("parsing PID")?;
 
-    // Verify it's actually ssh-agent-mux
     let cmdline = fs::read(format!("/proc/{pid}/cmdline")).context("process not found")?;
     if !String::from_utf8_lossy(&cmdline).contains("ssh-agent-mux") {
         bail!("PID {pid} is not ssh-agent-mux");
@@ -389,7 +443,6 @@ fn cmd_stop(_args: &CtlArgs) -> anyhow::Result<()> {
 
     unsafe { libc::kill(pid, libc::SIGTERM) };
 
-    // Wait for exit (5s timeout)
     for _ in 0..50 {
         if fs::metadata(format!("/proc/{pid}")).is_err() {
             println!("Stopped (pid {pid})");
@@ -415,7 +468,8 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn run_daemon(cli: StartArgs) -> anyhow::Result<()> {
-    let timeout = Duration::from_secs(cli.timeout);
+    let discover_timeout = Duration::from_secs(cli.timeout);
+    let sign_timeout = Duration::from_secs(cli.sign_timeout);
     let auto_discover = cli.agents.is_empty();
 
     let sock_dir = cli
@@ -428,19 +482,21 @@ fn run_daemon(cli: StartArgs) -> anyhow::Result<()> {
     let pid_path = cli.pid_file.unwrap_or_else(default_pid_path);
     let log_path = cli.log_file.unwrap_or_else(default_log_path);
 
-    check_pid_file(&pid_path)?;
-
     let primary_agent = cli.primary_agent.as_deref();
     let state = if auto_discover {
-        discover_and_build(timeout, &sock_path, primary_agent)?
+        discover_and_build(discover_timeout, sign_timeout, &sock_path, primary_agent)?
     } else {
-        let mut s = mux::build_mux_state_validated(&cli.agents, timeout)?;
+        let mut s = mux::build_mux_state_validated(&cli.agents, discover_timeout, sign_timeout)?;
         s.primary_agent = primary_agent.map(PathBuf::from);
         s
     };
 
     if state.key_map.is_empty() && !auto_discover {
-        bail!("No live agents found");
+        let paths: Vec<_> = cli.agents.iter().map(|p| p.display().to_string()).collect();
+        bail!(
+            "No live agents found. Tried: {}. Run `ssh-agent-probe` to diagnose.",
+            paths.join(", ")
+        );
     }
 
     info!(
@@ -461,11 +517,13 @@ fn run_daemon(cli: StartArgs) -> anyhow::Result<()> {
     init_logging(cli.foreground, &log_path);
     info!("Listening on {}", sock_path.display());
 
-    write_pid_file(&pid_path)?;
+    // Acquire PID file (atomic via flock)
+    let _pid_file = acquire_pid_file(&pid_path)?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let reload = Arc::new(AtomicBool::new(false));
     let locked = Arc::new(AtomicBool::new(false));
+    let refresh_mutex = Arc::new(Mutex::new(()));
 
     signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&shutdown))?;
     signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&shutdown))?;
@@ -482,8 +540,19 @@ fn run_daemon(cli: StartArgs) -> anyhow::Result<()> {
         let interval = Duration::from_secs(cli.refresh_interval);
         let own_socket = sock_path.clone();
         let primary = cli.primary_agent.clone();
+        let rm = Arc::clone(&refresh_mutex);
         thread::spawn(move || {
-            refresh_loop(state, interval, timeout, shutdown, reload, own_socket, primary)
+            refresh_loop(
+                state,
+                interval,
+                discover_timeout,
+                sign_timeout,
+                shutdown,
+                reload,
+                own_socket,
+                primary,
+                rm,
+            )
         });
     }
 
@@ -491,9 +560,17 @@ fn run_daemon(cli: StartArgs) -> anyhow::Result<()> {
     let own_socket_for_ctl = sock_path.clone();
     let primary_for_ctl = cli.primary_agent.clone();
     let state_for_ctl = Arc::clone(&state);
+    let rm_for_ctl = Arc::clone(&refresh_mutex);
     let sync_refresh = move || {
-        let _ =
-            do_refresh(&state_for_ctl, timeout, &own_socket_for_ctl, primary_for_ctl.as_deref());
+        let _ = do_refresh(
+            &state_for_ctl,
+            discover_timeout,
+            sign_timeout,
+            &own_socket_for_ctl,
+            primary_for_ctl.as_deref(),
+            &rm_for_ctl,
+            true, // blocking for control socket
+        );
     };
 
     // Accept loop
@@ -540,6 +617,7 @@ fn run_daemon(cli: StartArgs) -> anyhow::Result<()> {
                     &state,
                     &reload,
                     &locked,
+                    &shutdown,
                     start_time,
                     Some(&sync_refresh),
                 );
@@ -547,7 +625,7 @@ fn run_daemon(cli: StartArgs) -> anyhow::Result<()> {
         }
     }
 
-    cleanup(&sock_path, &ctl_path, &pid_path);
+    cleanup(&sock_path, &ctl_path);
     info!("Shutting down");
 
     Ok(())

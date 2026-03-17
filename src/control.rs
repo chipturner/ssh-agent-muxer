@@ -28,6 +28,7 @@ pub fn handle_control_client(
     state: &ArcSwap<MuxState>,
     reload: &AtomicBool,
     locked: &AtomicBool,
+    shutdown: &AtomicBool,
     start_time: Instant,
     discover_fn: Option<&dyn Fn()>,
 ) {
@@ -53,6 +54,10 @@ pub fn handle_control_client(
             }
             let snap = state.load();
             format!("OK {} keys\n", snap.key_map.len())
+        }
+        "STOP" => {
+            shutdown.store(true, Ordering::Relaxed);
+            "OK stopping\n".to_string()
         }
         _ => format!("ERR unknown command: {cmd}\n"),
     };

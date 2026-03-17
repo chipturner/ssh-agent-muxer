@@ -82,7 +82,7 @@ fn test_mux_merges_identities() {
     agent_b.add_key("key-from-b");
 
     let sockets = vec![agent_a.sock_path().to_path_buf(), agent_b.sock_path().to_path_buf()];
-    let state = Arc::new(mux::build_mux_state_from_sockets(&sockets, TIMEOUT).unwrap());
+    let state = Arc::new(mux::build_mux_state_from_sockets(&sockets, TIMEOUT, TIMEOUT).unwrap());
     assert_eq!(state.key_map.len(), 2);
 
     let (sock_path, _dir) = start_mux_listener(state);
@@ -98,7 +98,7 @@ fn test_mux_routes_sign_request() {
     agent_b.add_key("sign-key-b");
 
     let sockets = vec![agent_a.sock_path().to_path_buf(), agent_b.sock_path().to_path_buf()];
-    let state = Arc::new(mux::build_mux_state_from_sockets(&sockets, TIMEOUT).unwrap());
+    let state = Arc::new(mux::build_mux_state_from_sockets(&sockets, TIMEOUT, TIMEOUT).unwrap());
 
     let (sock_path, _dir) = start_mux_listener(state);
     let (_nkeys, key_blobs) = request_identities(&sock_path);
@@ -127,7 +127,7 @@ fn test_mux_deduplicates_keys() {
     agent_b.add_key_file(&privkey);
 
     let sockets = vec![agent_a.sock_path().to_path_buf(), agent_b.sock_path().to_path_buf()];
-    let state = mux::build_mux_state_from_sockets(&sockets, TIMEOUT).unwrap();
+    let state = mux::build_mux_state_from_sockets(&sockets, TIMEOUT, TIMEOUT).unwrap();
     assert_eq!(state.key_map.len(), 1);
 }
 
@@ -137,7 +137,7 @@ fn test_mux_unknown_message_returns_failure() {
     agent.add_key("dummy");
 
     let sockets = vec![agent.sock_path().to_path_buf()];
-    let state = Arc::new(mux::build_mux_state_from_sockets(&sockets, TIMEOUT).unwrap());
+    let state = Arc::new(mux::build_mux_state_from_sockets(&sockets, TIMEOUT, TIMEOUT).unwrap());
 
     let (sock_path, _dir) = start_mux_listener(state);
 
@@ -155,7 +155,7 @@ fn test_mux_unknown_key_sign_returns_failure() {
     agent.add_key("real-key");
 
     let sockets = vec![agent.sock_path().to_path_buf()];
-    let state = Arc::new(mux::build_mux_state_from_sockets(&sockets, TIMEOUT).unwrap());
+    let state = Arc::new(mux::build_mux_state_from_sockets(&sockets, TIMEOUT, TIMEOUT).unwrap());
 
     let (sock_path, _dir) = start_mux_listener(state);
 
@@ -174,7 +174,7 @@ fn test_mux_multiple_clients_concurrent() {
     agent.add_key("concurrent-key");
 
     let sockets = vec![agent.sock_path().to_path_buf()];
-    let state = Arc::new(mux::build_mux_state_from_sockets(&sockets, TIMEOUT).unwrap());
+    let state = Arc::new(mux::build_mux_state_from_sockets(&sockets, TIMEOUT, TIMEOUT).unwrap());
 
     let (sock_path, _dir) = start_mux_listener(state);
 
@@ -201,7 +201,7 @@ fn test_mux_refresh_sees_new_keys() {
     agent_a.add_key("refresh-key-a");
 
     let sockets_a = vec![agent_a.sock_path().to_path_buf()];
-    let initial = mux::build_mux_state_from_sockets(&sockets_a, TIMEOUT).unwrap();
+    let initial = mux::build_mux_state_from_sockets(&sockets_a, TIMEOUT, TIMEOUT).unwrap();
 
     let state = Arc::new(ArcSwap::from_pointee(initial));
     let dir = tempfile::tempdir().unwrap();
@@ -233,7 +233,7 @@ fn test_mux_refresh_sees_new_keys() {
     let agent_b = common::TestAgent::start();
     agent_b.add_key("refresh-key-b");
     let sockets_ab = vec![agent_a.sock_path().to_path_buf(), agent_b.sock_path().to_path_buf()];
-    let refreshed = mux::build_mux_state_from_sockets(&sockets_ab, TIMEOUT).unwrap();
+    let refreshed = mux::build_mux_state_from_sockets(&sockets_ab, TIMEOUT, TIMEOUT).unwrap();
     state.store(Arc::new(refreshed));
 
     let (nkeys, _) = request_identities(&sock_path);
@@ -247,7 +247,7 @@ fn test_mux_long_lived_client_sees_refresh() {
     agent_a.add_key("stable-key-a");
 
     let sockets_a = vec![agent_a.sock_path().to_path_buf()];
-    let initial = mux::build_mux_state_from_sockets(&sockets_a, TIMEOUT).unwrap();
+    let initial = mux::build_mux_state_from_sockets(&sockets_a, TIMEOUT, TIMEOUT).unwrap();
 
     let state = Arc::new(ArcSwap::from_pointee(initial));
     let dir = tempfile::tempdir().unwrap();
@@ -287,7 +287,7 @@ fn test_mux_long_lived_client_sees_refresh() {
     let agent_b = common::TestAgent::start();
     agent_b.add_key("stable-key-b");
     let sockets_ab = vec![agent_a.sock_path().to_path_buf(), agent_b.sock_path().to_path_buf()];
-    let refreshed = mux::build_mux_state_from_sockets(&sockets_ab, TIMEOUT).unwrap();
+    let refreshed = mux::build_mux_state_from_sockets(&sockets_ab, TIMEOUT, TIMEOUT).unwrap();
     state.store(Arc::new(refreshed));
 
     // Existing client SHOULD see 2 keys now (per-message state load)
@@ -301,7 +301,7 @@ fn test_mux_long_lived_client_sees_refresh() {
 
 #[test]
 fn test_mux_empty_state_returns_zero_keys() {
-    let state = mux::build_mux_state_from_sockets(&[], TIMEOUT).unwrap();
+    let state = mux::build_mux_state_from_sockets(&[], TIMEOUT, TIMEOUT).unwrap();
     assert_eq!(state.key_map.len(), 0);
 
     let state = Arc::new(state);
@@ -318,7 +318,7 @@ fn test_mux_write_without_primary_rejects() {
     agent.add_key("write-test");
 
     let sockets = vec![agent.sock_path().to_path_buf()];
-    let state = mux::build_mux_state_from_sockets(&sockets, TIMEOUT).unwrap();
+    let state = mux::build_mux_state_from_sockets(&sockets, TIMEOUT, TIMEOUT).unwrap();
     let state = Arc::new(state);
     let (sock_path, _dir) = start_mux_listener(state);
 
@@ -366,7 +366,7 @@ fn test_mux_remove_all_triggers_reload() {
     agent.add_key("reload-test");
 
     let sockets = vec![agent.sock_path().to_path_buf()];
-    let state = mux::build_mux_state_from_sockets(&sockets, TIMEOUT).unwrap();
+    let state = mux::build_mux_state_from_sockets(&sockets, TIMEOUT, TIMEOUT).unwrap();
 
     let (sock_path, _dir, reload) = start_mux_listener_with_reload(state);
 
@@ -389,11 +389,12 @@ fn test_mux_sign_failure_triggers_reload() {
     agent_b.add_key("sign-reload-b");
 
     let sockets = vec![agent_a.sock_path().to_path_buf(), agent_b.sock_path().to_path_buf()];
-    let state = mux::build_mux_state_from_sockets(&sockets, TIMEOUT).unwrap();
+    let state = mux::build_mux_state_from_sockets(&sockets, TIMEOUT, TIMEOUT).unwrap();
     assert_eq!(state.key_map.len(), 2);
 
     let (_, key_blobs) = {
-        let state_arc = Arc::new(mux::build_mux_state_from_sockets(&sockets, TIMEOUT).unwrap());
+        let state_arc =
+            Arc::new(mux::build_mux_state_from_sockets(&sockets, TIMEOUT, TIMEOUT).unwrap());
         let (sock, _dir) = start_mux_listener(state_arc);
         request_identities(&sock)
     };
@@ -420,7 +421,7 @@ fn test_extension_unknown_returns_extension_failure() {
     agent.add_key("ext-test");
 
     let sockets = vec![agent.sock_path().to_path_buf()];
-    let state = Arc::new(mux::build_mux_state_from_sockets(&sockets, TIMEOUT).unwrap());
+    let state = Arc::new(mux::build_mux_state_from_sockets(&sockets, TIMEOUT, TIMEOUT).unwrap());
     let (sock_path, _dir) = start_mux_listener(state);
 
     let mut msg = vec![proto::SSH_AGENTC_EXTENSION];
@@ -439,7 +440,7 @@ fn test_extension_session_bind_routes_by_key() {
     agent.add_key("session-bind-test");
 
     let sockets = vec![agent.sock_path().to_path_buf()];
-    let state = Arc::new(mux::build_mux_state_from_sockets(&sockets, TIMEOUT).unwrap());
+    let state = Arc::new(mux::build_mux_state_from_sockets(&sockets, TIMEOUT, TIMEOUT).unwrap());
     let (sock_path, _dir) = start_mux_listener(Arc::clone(&state));
 
     let (_, key_blobs) = request_identities(&sock_path);
@@ -472,7 +473,7 @@ fn test_lock_broadcast_blocks_identities() {
     agent.add_key("lock-test");
 
     let sockets = vec![agent.sock_path().to_path_buf()];
-    let state = mux::build_mux_state_from_sockets(&sockets, TIMEOUT).unwrap();
+    let state = mux::build_mux_state_from_sockets(&sockets, TIMEOUT, TIMEOUT).unwrap();
 
     let dir = tempfile::tempdir().unwrap();
     let sock_path = dir.path().join("mux.sock");
@@ -554,7 +555,7 @@ fn test_remove_identity_routes_by_key_blob() {
     agent_b.add_key("remove-b");
 
     let sockets = vec![agent_a.sock_path().to_path_buf(), agent_b.sock_path().to_path_buf()];
-    let state = Arc::new(mux::build_mux_state_from_sockets(&sockets, TIMEOUT).unwrap());
+    let state = Arc::new(mux::build_mux_state_from_sockets(&sockets, TIMEOUT, TIMEOUT).unwrap());
     let (sock_path, _dir) = start_mux_listener(Arc::clone(&state));
 
     let (_, key_blobs) = request_identities(&sock_path);
@@ -578,7 +579,7 @@ fn test_remove_all_broadcasts_to_all_backends() {
     agent_b.add_key("rmall-b");
 
     let sockets = vec![agent_a.sock_path().to_path_buf(), agent_b.sock_path().to_path_buf()];
-    let state = Arc::new(mux::build_mux_state_from_sockets(&sockets, TIMEOUT).unwrap());
+    let state = Arc::new(mux::build_mux_state_from_sockets(&sockets, TIMEOUT, TIMEOUT).unwrap());
     let (sock_path, _dir) = start_mux_listener(Arc::clone(&state));
 
     let mut stream = UnixStream::connect(&sock_path).unwrap();
@@ -587,7 +588,7 @@ fn test_remove_all_broadcasts_to_all_backends() {
     let resp = proto::read_message(&mut stream).unwrap();
     assert_eq!(resp, vec![proto::SSH_AGENT_SUCCESS]);
 
-    let state_after = mux::build_mux_state_from_sockets(&sockets, TIMEOUT).unwrap();
+    let state_after = mux::build_mux_state_from_sockets(&sockets, TIMEOUT, TIMEOUT).unwrap();
     assert_eq!(state_after.key_map.len(), 0, "all keys should be removed from all backends");
 }
 
@@ -597,7 +598,7 @@ fn test_add_without_primary_fails() {
     agent.add_key("add-test");
 
     let sockets = vec![agent.sock_path().to_path_buf()];
-    let state = Arc::new(mux::build_mux_state_from_sockets(&sockets, TIMEOUT).unwrap());
+    let state = Arc::new(mux::build_mux_state_from_sockets(&sockets, TIMEOUT, TIMEOUT).unwrap());
     let (sock_path, _dir) = start_mux_listener(state);
 
     let mut stream = UnixStream::connect(&sock_path).unwrap();
