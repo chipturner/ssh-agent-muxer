@@ -7,8 +7,9 @@ default:
 build:
     cargo build
 
-# Clippy (strict) then full test suite -- the pre-push gate
+# Clippy (strict), format check, and full test suite -- the pre-push gate
 check:
+    cargo fmt -- --check
     cargo clippy -- -D warnings
     cargo nextest run
 
