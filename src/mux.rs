@@ -13,6 +13,25 @@ pub struct MuxState {
     pub timeout: Duration,
 }
 
+/// Build mux state, skipping backend sockets that fail security validation.
+pub fn build_mux_state_validated(
+    sockets: &[PathBuf],
+    timeout: Duration,
+) -> anyhow::Result<MuxState> {
+    let valid: Vec<PathBuf> = sockets
+        .iter()
+        .filter(|p| match crate::security::validate_backend_socket(p) {
+            Ok(()) => true,
+            Err(reason) => {
+                log::warn!("Skipping {}: {reason}", p.display());
+                false
+            }
+        })
+        .cloned()
+        .collect();
+    build_mux_state_from_sockets(&valid, timeout)
+}
+
 /// Build mux state from an explicit list of agent socket paths.
 pub fn build_mux_state_from_sockets(
     sockets: &[PathBuf],

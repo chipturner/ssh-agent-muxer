@@ -1,5 +1,6 @@
 mod common;
 
+use arc_swap::ArcSwap;
 use ssh_agent_fixer::mux;
 use ssh_agent_fixer::proto;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -194,4 +195,96 @@ fn test_mux_multiple_clients_concurrent() {
     for h in handles {
         h.join().expect("client thread panicked");
     }
+}
+
+// --- ArcSwap refresh tests ---
+
+/// Start a mux listener backed by ArcSwap for testing state refresh.
+fn start_mux_listener_swappable(
+    state: Arc<ArcSwap<mux::MuxState>>,
+) -> (PathBuf, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let sock_path = dir.path().join("mux.sock");
+    let listener = UnixListener::bind(&sock_path).unwrap();
+
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            match conn {
+                Ok(stream) => {
+                    let snapshot = state.load_full();
+                    std::thread::spawn(move || mux::handle_client(stream, &snapshot));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    (sock_path, dir)
+}
+
+#[test]
+fn test_mux_refresh_sees_new_keys() {
+    let agent_a = common::TestAgent::start();
+    agent_a.add_key("refresh-key-a");
+
+    let sockets_a = vec![agent_a.sock_path().to_path_buf()];
+    let initial = mux::build_mux_state_from_sockets(&sockets_a, TIMEOUT).unwrap();
+
+    let state = Arc::new(ArcSwap::from_pointee(initial));
+    let (sock_path, _dir) = start_mux_listener_swappable(Arc::clone(&state));
+
+    // Initially 1 key
+    let (nkeys, _) = request_identities(&sock_path);
+    assert_eq!(nkeys, 1);
+
+    // Add a second agent and swap in new state
+    let agent_b = common::TestAgent::start();
+    agent_b.add_key("refresh-key-b");
+
+    let sockets_ab = vec![agent_a.sock_path().to_path_buf(), agent_b.sock_path().to_path_buf()];
+    let refreshed = mux::build_mux_state_from_sockets(&sockets_ab, TIMEOUT).unwrap();
+    state.store(Arc::new(refreshed));
+
+    // New connection should see 2 keys
+    let (nkeys, _) = request_identities(&sock_path);
+    assert_eq!(nkeys, 2);
+}
+
+#[test]
+fn test_mux_old_client_unaffected_by_refresh() {
+    let agent_a = common::TestAgent::start();
+    agent_a.add_key("stable-key-a");
+
+    let sockets_a = vec![agent_a.sock_path().to_path_buf()];
+    let initial = mux::build_mux_state_from_sockets(&sockets_a, TIMEOUT).unwrap();
+
+    let state = Arc::new(ArcSwap::from_pointee(initial));
+    let (sock_path, _dir) = start_mux_listener_swappable(Arc::clone(&state));
+
+    // Open a persistent connection
+    let mut client = UnixStream::connect(&sock_path).unwrap();
+    client.set_read_timeout(Some(TIMEOUT)).unwrap();
+
+    // Verify 1 key on this connection
+    proto::write_message(&mut client, &[proto::SSH_AGENTC_REQUEST_IDENTITIES]).unwrap();
+    let resp = proto::read_message(&mut client).unwrap();
+    let mut pos = 0;
+    assert_eq!(proto::read_u32(&resp[1..], &mut pos), Some(1));
+
+    // Swap in state with 2 keys
+    let agent_b = common::TestAgent::start();
+    agent_b.add_key("stable-key-b");
+    let sockets_ab = vec![agent_a.sock_path().to_path_buf(), agent_b.sock_path().to_path_buf()];
+    let refreshed = mux::build_mux_state_from_sockets(&sockets_ab, TIMEOUT).unwrap();
+    state.store(Arc::new(refreshed));
+
+    // Existing client still sees 1 key (its snapshot is frozen)
+    proto::write_message(&mut client, &[proto::SSH_AGENTC_REQUEST_IDENTITIES]).unwrap();
+    let resp = proto::read_message(&mut client).unwrap();
+    let mut pos = 0;
+    assert_eq!(proto::read_u32(&resp[1..], &mut pos), Some(1));
+
+    // New connection sees 2 keys
+    let (nkeys, _) = request_identities(&sock_path);
+    assert_eq!(nkeys, 2);
 }
