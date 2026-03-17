@@ -95,11 +95,8 @@ fn runtime_dir() -> PathBuf {
 }
 
 fn default_socket_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("SSH_AGENT_MUX_SOCKET") {
-        let p = PathBuf::from(dir);
-        if let Some(parent) = p.parent() {
-            return parent.to_path_buf();
-        }
+    if let Ok(dir) = std::env::var("SSH_AGENT_MUX_DIR") {
+        return PathBuf::from(dir);
     }
     runtime_dir().join("ssh-agent-mux")
 }
@@ -118,7 +115,16 @@ fn current_uid() -> u32 {
 
 // --- Discovery ---
 
-fn discover_live_sockets(timeout: Duration, exclude: &Path) -> anyhow::Result<Vec<PathBuf>> {
+/// Compare files by (st_dev, st_ino) to detect symlinks to our own sockets.
+fn same_inode(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let (Ok(ma), Ok(mb)) = (fs::metadata(a), fs::metadata(b)) else {
+        return false;
+    };
+    ma.dev() == mb.dev() && ma.ino() == mb.ino()
+}
+
+fn discover_live_sockets(timeout: Duration, exclude: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
     let discovery = discover::discover()?;
 
     let mut candidates: std::collections::BTreeSet<PathBuf> =
@@ -130,7 +136,8 @@ fn discover_live_sockets(timeout: Duration, exclude: &Path) -> anyhow::Result<Ve
     let sockets: Vec<PathBuf> = candidates
         .into_iter()
         .filter(|path| {
-            if path == exclude {
+            // Fast path check + inode comparison for symlink detection
+            if exclude.iter().any(|ex| path == ex || same_inode(path, ex)) {
                 return false;
             }
             let mut stream = match proto::agent_connect(path, timeout) {
@@ -153,7 +160,7 @@ fn discover_live_sockets(timeout: Duration, exclude: &Path) -> anyhow::Result<Ve
 fn discover_and_build(
     discover_timeout: Duration,
     sign_timeout: Duration,
-    exclude: &Path,
+    exclude: &[PathBuf],
     primary_agent: Option<&Path>,
 ) -> anyhow::Result<mux::MuxState> {
     let sockets = discover_live_sockets(discover_timeout, exclude)?;
@@ -162,15 +169,25 @@ fn discover_and_build(
     Ok(state)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn do_refresh(
     state: &ArcSwap<mux::MuxState>,
     discover_timeout: Duration,
     sign_timeout: Duration,
-    exclude: &Path,
+    exclude: &[PathBuf],
     primary_agent: Option<&Path>,
     refresh_mutex: &Mutex<()>,
+    locked: &AtomicBool,
     blocking: bool,
 ) -> anyhow::Result<usize> {
+    // Skip refresh while locked -- backends return 0 keys when locked,
+    // which would wipe the key_map and make unlock broadcast to nobody.
+    if locked.load(Ordering::Relaxed) {
+        log::debug!("Skipping refresh while locked");
+        let snap = state.load();
+        return Ok(snap.key_map.len());
+    }
+
     let guard = if blocking {
         Some(refresh_mutex.lock().unwrap_or_else(|e| e.into_inner()))
     } else {
@@ -324,7 +341,8 @@ fn refresh_loop(
     sign_timeout: Duration,
     shutdown: Arc<AtomicBool>,
     reload: Arc<AtomicBool>,
-    own_socket: PathBuf,
+    locked: Arc<AtomicBool>,
+    exclude: Vec<PathBuf>,
     primary_agent: Option<PathBuf>,
     refresh_mutex: Arc<Mutex<()>>,
 ) {
@@ -361,9 +379,10 @@ fn refresh_loop(
             &state,
             discover_timeout,
             sign_timeout,
-            &own_socket,
+            &exclude,
             primary_agent.as_deref(),
             &refresh_mutex,
+            &locked,
             false, // non-blocking in refresh loop
         ) {
             warn!("Refresh failed: {e}");
@@ -482,9 +501,10 @@ fn run_daemon(cli: StartArgs) -> anyhow::Result<()> {
     let pid_path = cli.pid_file.unwrap_or_else(default_pid_path);
     let log_path = cli.log_file.unwrap_or_else(default_log_path);
 
+    let exclude_sockets = vec![sock_path.clone(), ctl_path.clone()];
     let primary_agent = cli.primary_agent.as_deref();
     let state = if auto_discover {
-        discover_and_build(discover_timeout, sign_timeout, &sock_path, primary_agent)?
+        discover_and_build(discover_timeout, sign_timeout, &exclude_sockets, primary_agent)?
     } else {
         let mut s = mux::build_mux_state_validated(&cli.agents, discover_timeout, sign_timeout)?;
         s.primary_agent = primary_agent.map(PathBuf::from);
@@ -509,6 +529,7 @@ fn run_daemon(cli: StartArgs) -> anyhow::Result<()> {
     let ctl_listener = create_socket(&ctl_path)?;
 
     println!("SSH_AUTH_SOCK={}; export SSH_AUTH_SOCK;", sock_path.display());
+    println!("SSH_AGENT_MUX_DIR={}; export SSH_AGENT_MUX_DIR;", sock_dir.display());
 
     if !cli.foreground {
         daemonize()?;
@@ -538,9 +559,10 @@ fn run_daemon(cli: StartArgs) -> anyhow::Result<()> {
         let shutdown = Arc::clone(&shutdown);
         let reload = Arc::clone(&reload);
         let interval = Duration::from_secs(cli.refresh_interval);
-        let own_socket = sock_path.clone();
         let primary = cli.primary_agent.clone();
         let rm = Arc::clone(&refresh_mutex);
+        let locked = Arc::clone(&locked);
+        let exclude = exclude_sockets.clone();
         thread::spawn(move || {
             refresh_loop(
                 state,
@@ -549,7 +571,8 @@ fn run_daemon(cli: StartArgs) -> anyhow::Result<()> {
                 sign_timeout,
                 shutdown,
                 reload,
-                own_socket,
+                locked,
+                exclude,
                 primary,
                 rm,
             )
@@ -557,18 +580,20 @@ fn run_daemon(cli: StartArgs) -> anyhow::Result<()> {
     }
 
     // Build sync refresh closure for control socket
-    let own_socket_for_ctl = sock_path.clone();
+    let exclude_for_ctl = exclude_sockets;
     let primary_for_ctl = cli.primary_agent.clone();
     let state_for_ctl = Arc::clone(&state);
     let rm_for_ctl = Arc::clone(&refresh_mutex);
+    let locked_for_ctl = Arc::clone(&locked);
     let sync_refresh = move || {
         let _ = do_refresh(
             &state_for_ctl,
             discover_timeout,
             sign_timeout,
-            &own_socket_for_ctl,
+            &exclude_for_ctl,
             primary_for_ctl.as_deref(),
             &rm_for_ctl,
+            &locked_for_ctl,
             true, // blocking for control socket
         );
     };

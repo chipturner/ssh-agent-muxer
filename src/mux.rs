@@ -232,7 +232,8 @@ fn handle_add(msg: &[u8], state: &MuxState, reload: &AtomicBool) -> Vec<u8> {
     let Some(primary) = &state.primary_agent else {
         return vec![proto::SSH_AGENT_FAILURE];
     };
-    let response = forward_to_backend(primary, msg, state.discover_timeout, reload);
+    // Use sign_timeout: smartcard operations prompt for PIN and can take >2s
+    let response = forward_to_backend(primary, msg, state.sign_timeout, reload);
     set_reload(reload);
     response
 }
