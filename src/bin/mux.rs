@@ -503,6 +503,47 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
+fn print_env(sock_path: &Path, sock_dir: &Path) {
+    println!("SSH_AUTH_SOCK={}; export SSH_AUTH_SOCK;", sock_path.display());
+    println!("SSH_AGENT_MUX_DIR={}; export SSH_AGENT_MUX_DIR;", sock_dir.display());
+}
+
+/// Probe the control socket with a STATUS command to verify the daemon is responsive.
+fn probe_control_socket(ctl_path: &Path) -> bool {
+    let Ok(mut stream) = UnixStream::connect(ctl_path) else {
+        return false;
+    };
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+    stream.set_write_timeout(Some(Duration::from_secs(2))).ok();
+    if writeln!(stream, "STATUS").is_err() {
+        return false;
+    }
+    let _ = stream.flush();
+    let mut buf = String::new();
+    BufReader::new(&stream).read_line(&mut buf).is_ok() && !buf.is_empty()
+}
+
+/// Kill a stale daemon by reading its PID file and sending SIGTERM.
+fn kill_stale_daemon(pid_path: &Path) {
+    let Ok(contents) = fs::read_to_string(pid_path) else {
+        return;
+    };
+    let Ok(pid) = contents.trim().parse::<i32>() else {
+        return;
+    };
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    // Wait briefly for it to exit and release the flock
+    for _ in 0..20 {
+        if fs::metadata(format!("/proc/{pid}")).is_err() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    // Force kill if SIGTERM didn't work
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    thread::sleep(Duration::from_millis(100));
+}
+
 fn run_daemon(cli: StartArgs) -> anyhow::Result<()> {
     let discover_timeout = Duration::from_secs(cli.timeout);
     let sign_timeout = Duration::from_secs(cli.sign_timeout);
@@ -513,10 +554,28 @@ fn run_daemon(cli: StartArgs) -> anyhow::Result<()> {
         .as_ref()
         .and_then(|p| p.parent().map(PathBuf::from))
         .unwrap_or_else(default_socket_dir);
-    let sock_path = cli.socket.unwrap_or_else(|| sock_dir.join("agent.sock"));
+    let sock_path = cli.socket.clone().unwrap_or_else(|| sock_dir.join("agent.sock"));
     let ctl_path = sock_dir.join("control.sock");
     let pid_path = cli.pid_file.unwrap_or_else(default_pid_path);
     let log_path = cli.log_file.unwrap_or_else(default_log_path);
+
+    // Idempotent: if already running and healthy, just print env and exit.
+    // If running but wedged, kill it and take over.
+    let _pid_file = match acquire_pid_file(&pid_path) {
+        Ok(pf) => pf,
+        Err(_) => {
+            if probe_control_socket(&ctl_path) {
+                // Daemon is alive and responding
+                print_env(&sock_path, &sock_dir);
+                return Ok(());
+            }
+            // Daemon holds the lock but isn't responding -- kill and take over
+            eprintln!("Daemon not responding, restarting...");
+            kill_stale_daemon(&pid_path);
+            // Retry the lock after killing
+            acquire_pid_file(&pid_path)?
+        }
+    };
 
     let exclude_sockets = vec![sock_path.clone(), ctl_path.clone()];
     let primary_agent = cli.primary_agent.as_deref();
@@ -545,8 +604,7 @@ fn run_daemon(cli: StartArgs) -> anyhow::Result<()> {
     let agent_listener = create_socket(&sock_path)?;
     let ctl_listener = create_socket(&ctl_path)?;
 
-    println!("SSH_AUTH_SOCK={}; export SSH_AUTH_SOCK;", sock_path.display());
-    println!("SSH_AGENT_MUX_DIR={}; export SSH_AGENT_MUX_DIR;", sock_dir.display());
+    print_env(&sock_path, &sock_dir);
 
     if !cli.foreground {
         daemonize()?;
@@ -554,9 +612,6 @@ fn run_daemon(cli: StartArgs) -> anyhow::Result<()> {
 
     init_logging(cli.foreground, &log_path);
     info!("Listening on {}", sock_path.display());
-
-    // Acquire PID file (atomic via flock)
-    let _pid_file = acquire_pid_file(&pid_path)?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let reload = Arc::new(AtomicBool::new(false));

@@ -127,21 +127,20 @@ fn test_foreground_mode_clean_shutdown() {
 }
 
 #[test]
-fn test_pid_file_prevents_duplicate() {
+fn test_start_is_idempotent() {
     let agent = common::TestAgent::start();
     agent.add_key("dup-test-key");
 
     let daemon = TestDaemon::start(&agent);
 
-    // Try to start a second instance with the same PID file
+    // Second start with same PID file should succeed (idempotent) and print env
     let binary = env!("CARGO_BIN_EXE_ssh-agent-mux");
-    let sock2 = daemon._dir.path().join("mux2.sock");
     let output = Command::new(binary)
         .args([
             "start",
             "--foreground",
             "--socket",
-            sock2.to_str().unwrap(),
+            daemon.sock_path.to_str().unwrap(),
             "--pid-file",
             daemon.pid_path.to_str().unwrap(),
             "--agent",
@@ -150,9 +149,9 @@ fn test_pid_file_prevents_duplicate() {
         .output()
         .expect("spawn second instance");
 
-    assert!(!output.status.success(), "second instance should fail");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("Already running"), "expected 'Already running' error, got: {stderr}");
+    assert!(output.status.success(), "second start should succeed (idempotent)");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("SSH_AUTH_SOCK="), "should print export lines");
 }
 
 #[test]
@@ -208,4 +207,76 @@ fn test_multiple_agents_manual_mode() {
 
     let _ = child.kill();
     let _ = child.wait();
+}
+
+#[test]
+fn test_start_recovers_from_wedged_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let pid_path = dir.path().join("mux.pid");
+    let sock_path = dir.path().join("agent.sock");
+    let log_path = dir.path().join("mux.log");
+
+    // Simulate a wedged daemon: a bash process that holds the flock on the PID file
+    // and writes its own PID into it, but doesn't run a control socket.
+    // bash -c 'echo $$ > file; flock file -c "sleep 3600"' won't work because
+    // flock re-opens the file. Instead use: bash holds fd open via exec.
+    let script = format!(
+        r#"echo $BASHPID > {pid}; exec {{fd}}<{pid}; flock -x $fd; sleep 3600"#,
+        pid = pid_path.display()
+    );
+    let mut wedged = Command::new("bash")
+        .args(["-c", &script])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+
+    // Wait for the wedged process to acquire the lock and write its PID
+    let locked = (0..50).any(|_| {
+        std::thread::sleep(Duration::from_millis(100));
+        pid_path.exists()
+            && std::fs::read_to_string(&pid_path).is_ok_and(|s| {
+                s.trim()
+                    .parse::<u32>()
+                    .is_ok_and(|pid| std::fs::metadata(format!("/proc/{pid}")).is_ok())
+            })
+    });
+    assert!(locked, "wedged process should acquire lock");
+
+    // Start the real daemon -- should detect wedged (no control socket) and recover
+    let agent = common::TestAgent::start();
+    agent.add_key("recovery-test");
+
+    let binary = env!("CARGO_BIN_EXE_ssh-agent-mux");
+    let mut daemon = Command::new(binary)
+        .args([
+            "start",
+            "--foreground",
+            "--socket",
+            sock_path.to_str().unwrap(),
+            "--pid-file",
+            pid_path.to_str().unwrap(),
+            "--log-file",
+            log_path.to_str().unwrap(),
+            "--agent",
+            agent.sock_path().to_str().unwrap(),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn daemon");
+
+    // Wait for the daemon to start (socket appears = recovery succeeded)
+    let started = (0..80).any(|_| {
+        std::thread::sleep(Duration::from_millis(100));
+        sock_path.exists()
+    });
+
+    // Clean up
+    let _ = wedged.kill();
+    let _ = wedged.wait();
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+
+    assert!(started, "daemon should start after recovering from wedged process");
 }

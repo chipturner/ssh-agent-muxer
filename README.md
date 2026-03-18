@@ -38,14 +38,10 @@ That's it. `SSH_AUTH_SOCK` now points at the mux. All your SSH agents are merged
 Add to your `~/.bashrc` or `~/.zshrc`:
 
 ```bash
-# Start mux if not running, set SSH_AUTH_SOCK
-if ! ssh-agent-mux status --json >/dev/null 2>&1; then
-    eval "$(ssh-agent-mux start)"
-else
-    export SSH_AUTH_SOCK="$XDG_RUNTIME_DIR/ssh-agent-mux/agent.sock"
-    export SSH_AGENT_MUX_DIR="$XDG_RUNTIME_DIR/ssh-agent-mux"
-fi
+eval "$(ssh-agent-mux start)"
 ```
+
+This is idempotent -- if the daemon is already running, it prints the export lines and exits. If not, it starts the daemon first. Safe to call on every shell invocation.
 
 ## Usage
 
