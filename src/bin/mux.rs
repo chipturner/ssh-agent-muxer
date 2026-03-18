@@ -132,26 +132,43 @@ fn discover_live_sockets(timeout: Duration, exclude: &[PathBuf]) -> anyhow::Resu
     for path in discover::scan_socket_dirs() {
         candidates.insert(path);
     }
+    log::debug!("Discovery found {} candidate sockets", candidates.len());
 
     let sockets: Vec<PathBuf> = candidates
         .into_iter()
         .filter(|path| {
-            // Fast path check + inode comparison for symlink detection
             if exclude.iter().any(|ex| path == ex || same_inode(path, ex)) {
                 return false;
             }
+            let start = std::time::Instant::now();
+            log::debug!("Probing {}", path.display());
             let mut stream = match proto::agent_connect(path, timeout) {
                 Ok(s) => s,
-                Err(_) => return false,
+                Err(e) => {
+                    log::debug!(
+                        "Probe connect failed after {:?}: {}: {e}",
+                        start.elapsed(),
+                        path.display()
+                    );
+                    return false;
+                }
             };
             let request = [0u8, 0, 0, 1, proto::SSH_AGENTC_REQUEST_IDENTITIES];
             if stream.write_all(&request).is_err() {
+                log::debug!("Probe write failed after {:?}: {}", start.elapsed(), path.display());
                 return false;
             }
-            matches!(
+            let alive = matches!(
                 proto::read_message(&mut stream),
                 Ok(b) if !b.is_empty() && b[0] == proto::SSH2_AGENT_IDENTITIES_ANSWER
-            )
+            );
+            let elapsed = start.elapsed();
+            if elapsed.as_secs() >= 1 {
+                log::warn!("Slow probe: {} took {:?} (alive={alive})", path.display(), elapsed);
+            } else {
+                log::debug!("Probe {} alive={alive} in {:?}", path.display(), elapsed);
+            }
+            alive
         })
         .collect();
     Ok(sockets)
@@ -624,6 +641,7 @@ fn run_daemon(cli: StartArgs) -> anyhow::Result<()> {
             if let Err(reason) = security::check_peer_uid(&stream) {
                 warn!("Rejected connection: {reason}");
             } else {
+                log::debug!("Accepted agent connection");
                 let state = Arc::clone(&state);
                 let reload = Arc::clone(&reload);
                 let locked = Arc::clone(&locked);

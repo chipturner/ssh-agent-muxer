@@ -120,6 +120,7 @@ pub fn handle_client(
     reload: &AtomicBool,
     locked: &AtomicBool,
 ) {
+    log::debug!("Client connected");
     loop {
         let msg = match proto::read_message(&mut stream) {
             Ok(m) => m,
@@ -133,6 +134,12 @@ pub fn handle_client(
 
         let snap = state.load();
         let is_locked = locked.load(Ordering::Relaxed);
+        log::debug!(
+            "Request: {} (type={}) len={} locked={is_locked}",
+            proto::msg_type_name(msg[0]),
+            msg[0],
+            msg.len()
+        );
 
         let response = match msg[0] {
             proto::SSH_AGENTC_UNLOCK => handle_unlock(&msg, &snap, locked, reload),
@@ -154,7 +161,10 @@ pub fn handle_client(
             _ => vec![proto::SSH_AGENT_FAILURE],
         };
 
+        let rt = *response.first().unwrap_or(&0);
+        log::debug!("Response: {} (type={}) len={}", proto::msg_type_name(rt), rt, response.len());
         if proto::write_message(&mut stream, &response).is_err() {
+            log::debug!("Write to client failed");
             return;
         }
     }
@@ -276,9 +286,11 @@ fn handle_remove_all(msg: &[u8], state: &MuxState, reload: &AtomicBool) -> Vec<u
 fn handle_sign_request(msg: &[u8], state: &MuxState, reload: &AtomicBool) -> Vec<u8> {
     let mut pos = 1;
     let Some(key_blob) = proto::read_string(msg, &mut pos) else {
+        log::debug!("Sign request: failed to parse key blob");
         return vec![proto::SSH_AGENT_FAILURE];
     };
     let Some(backend_path) = state.key_map.get(key_blob) else {
+        log::debug!("Sign request: key not found in {} backends", state.key_map.len());
         return vec![proto::SSH_AGENT_FAILURE];
     };
     forward_to_backend(backend_path, msg, state.sign_timeout, reload)
@@ -311,28 +323,64 @@ fn forward_to_backend(
     timeout: Duration,
     reload: &AtomicBool,
 ) -> Vec<u8> {
+    use std::time::Instant;
+
+    let t = *msg.first().unwrap_or(&0);
+    let op = proto::msg_type_name(t);
+    log::debug!("Forwarding {op} to {} (timeout {}s)", backend_path.display(), timeout.as_secs());
+
     if let Err(reason) = crate::security::validate_backend_socket(backend_path) {
-        log::warn!("Backend rejected on connect: {}: {reason}", backend_path.display());
+        log::warn!("Backend rejected: {}: {reason}", backend_path.display());
         set_reload(reload);
         return vec![proto::SSH_AGENT_FAILURE];
     }
 
+    let start = Instant::now();
+
     let mut backend = match proto::agent_connect(backend_path, timeout) {
         Ok(s) => s,
-        Err(_) => {
+        Err(e) => {
+            log::warn!(
+                "Backend connect failed after {:?}: {}: {e}",
+                start.elapsed(),
+                backend_path.display()
+            );
             set_reload(reload);
             return vec![proto::SSH_AGENT_FAILURE];
         }
     };
 
-    if proto::write_message(&mut backend, msg).is_err() {
+    if let Err(e) = proto::write_message(&mut backend, msg) {
+        log::warn!(
+            "Backend write failed after {:?}: {}: {e}",
+            start.elapsed(),
+            backend_path.display()
+        );
         set_reload(reload);
         return vec![proto::SSH_AGENT_FAILURE];
     }
 
     match proto::read_message(&mut backend) {
-        Ok(response) => response,
-        Err(_) => {
+        Ok(response) => {
+            let elapsed = start.elapsed();
+            let rt = *response.first().unwrap_or(&0);
+            if elapsed.as_secs() >= 1 {
+                log::warn!("Slow backend: {op} to {} took {:?}", backend_path.display(), elapsed);
+            }
+            log::debug!(
+                "Backend {op} response: {} len={} in {:?}",
+                proto::msg_type_name(rt),
+                response.len(),
+                elapsed
+            );
+            response
+        }
+        Err(e) => {
+            log::warn!(
+                "Backend read failed after {:?}: {}: {e}",
+                start.elapsed(),
+                backend_path.display()
+            );
             set_reload(reload);
             vec![proto::SSH_AGENT_FAILURE]
         }
