@@ -21,6 +21,12 @@ fmt:
 fmt-check:
     cargo fmt -- --check
 
+cargo-upgrade *args:
+	cargo-upgrade upgrade {{ args }}
+	cargo update
+	cargo clippy -- -D warnings
+	cargo test
+
 # Run tests (pass args to filter, e.g. `just test fingerprint`)
 test *args:
     cargo nextest run {{ args }}

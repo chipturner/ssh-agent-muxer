@@ -124,6 +124,7 @@ mod tests {
     #[test]
     fn test_validate_own_socket() {
         let dir = tempfile::tempdir().unwrap();
+        chmod_socket(dir.path(), 0o700);
         let sock_path = dir.path().join("test.sock");
         let _listener = UnixListener::bind(&sock_path).unwrap();
         chmod_socket(&sock_path, 0o600);

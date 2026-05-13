@@ -16,7 +16,7 @@ struct TestDaemon {
 
 impl TestDaemon {
     fn start(agent: &common::TestAgent) -> Self {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = common::secure_tempdir();
         let sock_path = dir.path().join("mux.sock");
         let pid_path = dir.path().join("mux.pid");
         let log_path = dir.path().join("mux.log");
@@ -161,7 +161,7 @@ fn test_multiple_agents_manual_mode() {
     agent_a.add_key("multi-key-a");
     agent_b.add_key("multi-key-b");
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::secure_tempdir();
     let sock_path = dir.path().join("mux.sock");
     let pid_path = dir.path().join("mux.pid");
     let log_path = dir.path().join("mux.log");
@@ -211,7 +211,7 @@ fn test_multiple_agents_manual_mode() {
 
 #[test]
 fn test_start_recovers_from_wedged_daemon() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::secure_tempdir();
     let pid_path = dir.path().join("mux.pid");
     let sock_path = dir.path().join("agent.sock");
     let log_path = dir.path().join("mux.log");

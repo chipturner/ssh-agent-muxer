@@ -1,7 +1,19 @@
 #![allow(dead_code)]
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
+
+/// Create a tempdir with mode 0700, matching what real ssh-agent does for its
+/// socket directory. Required because the mux rejects backend sockets whose
+/// parent directory is group/world-writable, and `tempfile::tempdir()` honors
+/// the caller's umask (which may be 002).
+pub fn secure_tempdir() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("chmod tempdir");
+    dir
+}
 
 /// A real ssh-agent process for testing. Killed and cleaned up on drop.
 pub struct TestAgent {
@@ -13,7 +25,7 @@ pub struct TestAgent {
 impl TestAgent {
     /// Spawn a new ssh-agent listening on a socket in a temp directory.
     pub fn start() -> Self {
-        let dir = tempfile::tempdir().expect("create tempdir");
+        let dir = secure_tempdir();
         let sock_path = dir.path().join("agent.sock");
 
         let child = Command::new("ssh-agent")
