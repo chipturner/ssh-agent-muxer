@@ -35,7 +35,7 @@ jobs:
           cd target/${{ matrix.target }}/release
           tar czf ../../../ssh-agent-mux-${{ matrix.target }}.tar.gz ssh-agent-mux ssh-agent-probe
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ssh-agent-mux-${{ matrix.target }}
           path: ssh-agent-mux-${{ matrix.target }}.tar.gz
