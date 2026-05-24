@@ -1,0 +1,131 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package (both binaries)
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../ssh-agent-mux-${{ matrix.target }}.tar.gz ssh-agent-mux ssh-agent-probe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ssh-agent-mux-${{ matrix.target }}
+          path: ssh-agent-mux-${{ matrix.target }}.tar.gz
+
+  release:
+    name: GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: sha256sum ssh-agent-mux-*.tar.gz > SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            ssh-agent-mux-*.tar.gz
+            SHA256SUMS
+
+  update-homebrew:
+    name: Update Homebrew formula
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Get version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download SHA256SUMS from release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "${GITHUB_REF_NAME}" --pattern SHA256SUMS
+
+      - name: Parse checksums
+        id: sums
+        run: |
+          extract() { grep "$1" SHA256SUMS | cut -d' ' -f1; }
+          echo "aarch64_linux=$(extract aarch64-unknown-linux-musl)" >> "$GITHUB_OUTPUT"
+          echo "x86_64_linux=$(extract x86_64-unknown-linux-musl)" >> "$GITHUB_OUTPUT"
+
+      - name: Update formula and push to tap
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SHA_AARCH64_LINUX: ${{ steps.sums.outputs.aarch64_linux }}
+          SHA_X86_64_LINUX: ${{ steps.sums.outputs.x86_64_linux }}
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/chipturner/homebrew-tap.git" homebrew-tap
+          cd homebrew-tap
+          mkdir -p Formula
+          cat > Formula/ssh-agent-mux.rb << FORMULA
+          class SshAgentMux < Formula
+            desc "SSH agent multiplexer and diagnostic tool for Linux"
+            homepage "https://github.com/chipturner/ssh-agent-fixer"
+            version "${VERSION}"
+            license "MIT"
+
+            depends_on :linux
+
+            on_linux do
+              on_arm do
+                url "https://github.com/chipturner/ssh-agent-fixer/releases/download/v#{version}/ssh-agent-mux-aarch64-unknown-linux-musl.tar.gz"
+                sha256 "${SHA_AARCH64_LINUX}"
+              end
+              on_intel do
+                url "https://github.com/chipturner/ssh-agent-fixer/releases/download/v#{version}/ssh-agent-mux-x86_64-unknown-linux-musl.tar.gz"
+                sha256 "${SHA_X86_64_LINUX}"
+              end
+            end
+
+            def install
+              bin.install "ssh-agent-mux", "ssh-agent-probe"
+            end
+
+            test do
+              system bin/"ssh-agent-mux", "--help"
+              system bin/"ssh-agent-probe", "--help"
+            end
+          end
+          FORMULA
+          sed -i 's/^          //' Formula/ssh-agent-mux.rb
+          git add Formula/ssh-agent-mux.rb
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git diff --cached --quiet || git commit -m "Update ssh-agent-mux to ${VERSION}" && git push

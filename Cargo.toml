@@ -2,7 +2,15 @@
 name = "ssh-agent-mux"
 version = "0.1.0"
 edition = "2024"
+authors = ["Chip Turner <cturner@pattern.net>"]
+description = "SSH agent multiplexer and diagnostic tool for Linux -- merges all live agents into one stable socket"
+documentation = "https://github.com/chipturner/ssh-agent-fixer"
+homepage = "https://github.com/chipturner/ssh-agent-fixer"
+repository = "https://github.com/chipturner/ssh-agent-fixer"
+keywords = ["ssh", "ssh-agent", "tmux", "linux"]
+categories = ["command-line-utilities", "authentication"]
 license = "MIT"
+exclude = [".github/", "CLAUDE.md", "justfile"]
 
 [lib]
 name = "ssh_agent_mux"
