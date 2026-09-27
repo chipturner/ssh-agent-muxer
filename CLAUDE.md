@@ -18,7 +18,7 @@ SSH agent multiplexer and diagnostic tool for Linux. Solves the stale `SSH_AUTH_
 Rust edition 2024. Uses `just` as the task runner. Tests via `cargo-nextest`.
 
 ```bash
-just check                # clippy + full test suite (pre-push gate)
+just check                # fmt-check + clippy + full test suite (pre-push gate)
 just fmt                  # format all source files
 just test                 # all tests (pass args to filter: just test fingerprint)
 just test-proto           # wire protocol unit tests only
@@ -93,5 +93,5 @@ The mux routes sign requests by matching the `key_blob` field against `key_map`.
 - **No process leaks**: All tests must clean up ssh-agent processes. `TestAgent` and `TestDaemon` have `Drop` impls.
 
 ### Workflow
-- Run `just fmt` after making code changes.
-- Run `just check` (clippy + full test suite) before finishing work.
+- `.claude/settings.json` runs `just fmt` after every Edit/Write; `just check` still verifies formatting.
+- Run `just check` (fmt-check + clippy + full test suite) before finishing work.
